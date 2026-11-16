@@ -609,6 +609,13 @@ function applyInstanceDefaults(instance) {
     next.forward_port = Number(next.port) + 1;
   }
 
+  // socat would be told to listen on the port Chrome itself holds, and the
+  // launcher clears a busy forward port by killing whatever listens there -
+  // which here is the browser. Refused while someone can still see the form.
+  if (next.use_socat && Number(next.forward_port) === Number(next.port)) {
+    throw createHttpError(400, 'Forward port must differ from the debug port');
+  }
+
   if (typeof next.use_socat === 'undefined') {
     next.use_socat = false;
   }

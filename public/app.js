@@ -39,6 +39,10 @@ const editLaunchModeGroup = document.getElementById('editLaunchModeGroup');
 const editLaunchMode = document.getElementById('editLaunchMode');
 const editInstanceNotes = document.getElementById('editInstanceNotes');
 const editChromeFlags = document.getElementById('editChromeFlags');
+const editForwardGroup = document.getElementById('editForwardGroup');
+const editUseSocat = document.getElementById('editUseSocat');
+const editForwardPort = document.getElementById('editForwardPort');
+const editForwardHint = document.getElementById('editForwardHint');
 const editInstanceModal = new bootstrap.Modal(document.getElementById('editInstanceModal'));
 const importCookiesModalEl = document.getElementById('importCookiesModal');
 const importCookiesModal = new bootstrap.Modal(importCookiesModalEl);
@@ -686,6 +690,14 @@ function openEditInstance(id) {
     editInstanceNotes.value = inst.notes || '';
     // Stored as an array; shown one per line, which is how people read them.
     editChromeFlags.value = (inst.chrome_flags || []).join('\n');
+
+    // Forwarding is a local-spawner concern: an external resource is reached at
+    // whatever address it already listens on, so there is nothing to publish.
+    editForwardGroup.style.display = inst.type === 'local' ? 'block' : 'none';
+    editUseSocat.checked = Boolean(inst.use_socat);
+    editForwardPort.value = inst.forward_port || '';
+    syncEditForwardControls();
+
     editInstanceModal.show();
 }
 
@@ -721,6 +733,35 @@ async function prefillImportOrigin(instanceId) {
     }
 }
 
+// The toggle owns the port field: with forwarding off there is no port to set,
+// and turning it on without a port would mean guessing, so we suggest the same
+// default the server would pick (debug port + 1) and show what it will publish.
+function syncEditForwardControls() {
+    const inst = allInstances.find(item => item.id === currentEditInstanceId);
+    const debugPort = Number(inst?.port) || 0;
+    const on = editUseSocat.checked;
+
+    editForwardPort.disabled = !on;
+    if (on && !editForwardPort.value.trim() && debugPort > 0) {
+        editForwardPort.value = debugPort + 1;
+    }
+
+    if (!inst) {
+        editForwardHint.textContent = '';
+        return;
+    }
+    if (!on) {
+        editForwardHint.textContent = `Forwarding off: the CDP port stays on ${inst.host}:${debugPort} only.`;
+        return;
+    }
+    const forwardPort = editForwardPort.value.trim() || (debugPort + 1);
+    editForwardHint.textContent =
+        `Publishes ${forwardPort} on every interface and routes it to 127.0.0.1:${debugPort}. Applied the next time this instance starts.`;
+}
+
+editUseSocat.addEventListener('change', syncEditForwardControls);
+editForwardPort.addEventListener('input', syncEditForwardControls);
+
 editInstanceForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     if (!currentEditInstanceId) return;
@@ -733,6 +774,14 @@ editInstanceForm.addEventListener('submit', async (e) => {
     const inst = allInstances.find(item => item.id === currentEditInstanceId);
     if (inst?.type === 'local') {
         payload.launch_mode = editLaunchMode.value;
+        payload.use_socat = editUseSocat.checked;
+        // Only meaningful while forwarding is on; turning it off makes the
+        // server drop the port itself, so sending one would just be noise.
+        if (editUseSocat.checked) {
+            const typed = editForwardPort.value.trim();
+            // null, not "", asks the server for the default (debug port + 1).
+            payload.forward_port = typed === '' ? null : Number(typed);
+        }
     }
 
     const res = await fetch(`/api/instances/${currentEditInstanceId}`, {
