@@ -9,6 +9,8 @@ Chrome Fleet Control is a dashboard for managing multiple Chrome or Chromium ins
 - Per-instance cards show live **uptime** (how long it has been running) and **open tab count**
 - Bulk **Start All / Stop All** and instant instance **search/filter**
 - Keep separate browser profiles per instance
+- Import a session from **files or a pasted blob**: cookie exports, `localStorage` dumps,
+  or a mix, with the target site worked out for you
 - Port forwarding through `socat`, switchable per instance from the Edit dialog while it is stopped
 - Per-instance launch mode selector with `GUI`, `Headless via Xvfb`, and `Native Chrome Headless`
 - **Per-instance Chrome switches** (`--proxy-server`, `--proxy-bypass-list`, `--lang`, anything else),
@@ -18,6 +20,15 @@ Chrome Fleet Control is a dashboard for managing multiple Chrome or Chromium ins
   special keys, and Ctrl/Cmd shortcuts)
 - Tab toolbar with **back / forward / reload**, and an address bar that follows the page
   wherever it navigates itself
+- **Web / Mobile preview** per tab: viewport, user agent, Client Hints and touch are set
+  together from a device preset, so a site serves its real mobile build rather than its
+  desktop one squeezed into a narrow window
+- **Network panel** per tab, like a browser's own: requests as they happen, with status,
+  type, size and timing, filters, and a detail pane carrying request and response headers
+  (`set-cookie` included), the payload, the response body, and a copy-as-curl button
+- **Copy and paste across the wire**: Ctrl+C takes the page's selection to your clipboard
+  and Ctrl+V types yours into the page, with a fallback box for the plain-HTTP LAN case
+  where browsers refuse clipboard access
 - **Inspect loaded HTML** per tab: view, copy, or download the DOM *after* JavaScript has
   run — not the raw server response
 - Run JavaScript in any tab and get the result back as JSON
@@ -261,6 +272,9 @@ What it covers:
 | Instances | list / read / create / update / delete, `start`, `stop`, `logs` |
 | Tabs | list, open, close, `navigate`, `reload`, `history/back`, `history/forward`, `activate` |
 | Page content | `html` (loaded DOM, `format=json\|html\|text`), `evaluate`, `screenshot`, `pdf`, `inspect` |
+| Device | `emulation` — read or set viewport, user agent, Client Hints and touch per tab |
+| Network | `network/start`, `network` (poll with `since_seq`), `network/:requestId` (headers + body), `network/stop` |
+| Clipboard | `selection` (what the page has selected) and `paste` (into the focused element) |
 | Whole instance | `tabs/html` and `tabs/screenshot` capture every tab in one call |
 | Input | `input` — mouse, key, and text events |
 | Cookies | export (`GET /cookies`) and import (`POST /cookies/import`) |

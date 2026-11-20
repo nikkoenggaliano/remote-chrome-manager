@@ -358,3 +358,153 @@ body {
     opacity: 0.55;
     white-space: nowrap;
 }
+
+/* --- Network panel ------------------------------------------------------- */
+/* Sits under the live view like a browser's own drawer: the page keeps the
+   room it needs, the log takes a fixed slice rather than a share that moves
+   every time a request arrives. */
+.network-panel {
+    /* A fixed share of the control view, and it must not be squeezed: the
+       screen above it is the flexible one. */
+    flex: 0 0 42%;
+    min-height: 160px;
+    background: var(--bg-card);
+    color: var(--text-main);
+}
+
+/* The control view is laid out as a column: address bar, the live frame, then
+   the network panel and the status bar. It carries Bootstrap's `flex-column`,
+   but that utility only sets a direction - nothing ever made it a flex
+   container, so the frame sized itself to the image and pushed the status bar
+   out of the modal. `.d-none` keeps its !important, so hiding still wins. */
+#tabContent:not(.d-none) {
+    display: flex;
+}
+
+/* And the frame has to be allowed to shrink below the height of the image it
+   is showing, or there is no room left for the panel underneath it. */
+#screenWrapper {
+    min-height: 0;
+}
+
+.network-table {
+    font-size: 0.76rem;
+    table-layout: fixed;
+    width: 100%;
+}
+
+.network-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--border-color);
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-muted);
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.network-table td {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+    cursor: pointer;
+}
+
+.network-table tbody tr:hover { background: var(--bg-hover); }
+.network-table tbody tr.active { background: rgba(13, 110, 253, 0.16); }
+.network-table tbody tr.net-failed td:first-child { box-shadow: inset 3px 0 0 #dc3545; }
+.network-table tbody tr.net-warn td:first-child { box-shadow: inset 3px 0 0 #fd7e14; }
+
+.network-name { display: flex; align-items: baseline; gap: 6px; }
+.network-name .net-path { overflow: hidden; text-overflow: ellipsis; }
+.network-name .net-host { color: var(--text-muted); font-size: 0.68rem; flex: 0 0 auto; }
+
+.network-detail {
+    width: 46%;
+    min-width: 260px;
+    border-left: 1px solid var(--border-color);
+    background: var(--bg-card);
+    font-size: 0.76rem;
+}
+
+.network-detail h6 {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-muted);
+    font-weight: 700;
+    margin: 0 0 4px;
+}
+
+.network-detail .net-kv {
+    display: grid;
+    grid-template-columns: minmax(90px, 32%) 1fr;
+    gap: 2px 8px;
+    word-break: break-all;
+}
+
+.network-detail .net-kv > span:nth-child(odd) { color: var(--text-muted); }
+
+.network-detail pre {
+    background: var(--terminal-bg);
+    color: var(--terminal-text);
+    border-radius: 4px;
+    padding: 8px;
+    margin: 0;
+    max-height: 220px;
+    overflow: auto;
+    font-size: 0.72rem;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+/* --- Clipboard helper ---------------------------------------------------- */
+.control-paste-box {
+    position: absolute;
+    z-index: 1200;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(520px, 90%);
+    padding: 12px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+    background: var(--modal-bg);
+    color: var(--text-main);
+    box-shadow: var(--shadow-md);
+}
+
+.control-notice {
+    position: absolute;
+    z-index: 1250;
+    bottom: 14px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: 80%;
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    background: rgba(33, 37, 41, 0.92);
+    color: #f8f9fa;
+    box-shadow: var(--shadow-sm);
+    pointer-events: none;
+}
+
+.control-notice.is-bad { background: rgba(176, 42, 55, 0.95); }
+.control-notice.is-good { background: rgba(25, 135, 84, 0.95); }
+
+/* An emulated device is shown at its own width rather than stretched across the
+   panel. A 393 px phone blown up to 1100 px tells you nothing about how the
+   page really looks on one. */
+#tabScreenshot.device-frame {
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    box-shadow: var(--shadow-md);
+    margin-top: 10px;
+    background: #fff;
+}

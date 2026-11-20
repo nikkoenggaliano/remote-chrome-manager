@@ -485,8 +485,8 @@
                             <input type="text" class="form-control form-control-theme" id="importCookiesInstanceName" disabled>
                         </div>
                         <div class="mb-3">
-                            <label class="form-label text-theme-muted small fw-bold">SESSION FILES</label>
-                            <input type="file" class="form-control form-control-theme" id="importCookiesFiles" accept=".txt,.json,text/plain,application/json" multiple required>
+                            <label class="form-label text-theme-muted small fw-bold">SESSION FILES <span class="fw-normal">(optional if you paste below)</span></label>
+                            <input type="file" class="form-control form-control-theme" id="importCookiesFiles" accept=".txt,.json,text/plain,application/json" multiple>
                             <div class="form-text text-theme-muted">
                                 Cookie exports (Netscape <code>cookies.txt</code> or JSON) and localStorage dumps are both accepted,
                                 and you can mix them in one upload. For a site whose session is a token rather than a cookie, run
@@ -495,6 +495,19 @@
                         </div>
                         <div id="importCookiesSelectedFiles" class="p-3 border rounded border-theme bg-theme-surface small text-theme-muted mb-3">
                             No files selected.
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label text-theme-muted small fw-bold" for="importSessionPaste">OR PASTE IT STRAIGHT IN</label>
+                            <textarea class="form-control form-control-theme font-monospace" id="importSessionPaste" rows="5" spellcheck="false"
+                                      style="font-size: 0.78rem;"
+                                      placeholder='[{"name":"session","value":"abc","domain":".example.com"}]&#10;{"token":"eyJhbGciOi...","user":"{\"id\":7}"}'></textarea>
+                            <div class="form-text text-theme-muted">
+                                Same formats as a file, with no file to make first: the output of
+                                <code>copy(JSON.stringify(localStorage))</code>, a Cookie-Editor export, or a
+                                <code>cookies.txt</code>. Paste and upload can be used together.
+                            </div>
+                            <div id="importPasteSniff" class="x-small mt-1 d-none"></div>
                         </div>
 
                         <div id="importStorageOptions" class="d-none">
@@ -597,6 +610,17 @@
                                 <option value="0.5">50%</option>
                             </select>
                          </div>
+                         <div class="btn-group btn-group-sm" role="group" aria-label="Device">
+                            <button type="button" class="btn btn-outline-secondary active" id="btnDeviceDesktop"
+                                    title="Show the page as the real desktop browser">
+                                <i class="bi bi-display"></i> Web
+                            </button>
+                            <button type="button" class="btn btn-outline-secondary" id="btnDeviceMobile"
+                                    title="Emulate a phone: viewport, user agent and touch together, then reload so the site re-renders">
+                                <i class="bi bi-phone"></i> Mobile
+                            </button>
+                            <select id="devicePreset" class="form-select form-select-sm form-select-theme d-none" style="max-width: 128px;" title="Device to emulate"></select>
+                         </div>
                          <button type="button" class="btn btn-sm btn-outline-secondary" onclick="refreshScreenshot()" title="Refresh once"><i class="bi bi-arrow-clockwise"></i></button>
                          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                     </div>
@@ -617,7 +641,7 @@
                         
                         <!-- Main View -->
 <div class="col-md-9 d-flex flex-column h-100 bg-black">
-    <div id="tabContent" class="d-none h-100 flex-column">
+    <div id="tabContent" class="d-none h-100 flex-column position-relative">
         <!-- Address Bar -->
         <div class="p-2 border-bottom border-theme bg-theme-surface d-flex gap-2 align-items-center">
             <div class="btn-group btn-group-sm">
@@ -629,6 +653,15 @@
             <button class="btn btn-sm btn-primary" id="btnGo">Go</button>
             <button class="btn btn-sm btn-outline-info text-nowrap" id="btnInspectHtml" title="Inspect the HTML the browser has actually loaded">
                 <i class="bi bi-code-slash"></i> HTML
+            </button>
+            <button class="btn btn-sm btn-outline-warning text-nowrap" id="btnNetworkToggle" title="Record this tab's requests and responses">
+                <i class="bi bi-activity"></i> Network
+            </button>
+            <button class="btn btn-sm btn-outline-secondary" id="btnCopySelection" title="Copy the page's selected text to your clipboard">
+                <i class="bi bi-clipboard-check"></i>
+            </button>
+            <button class="btn btn-sm btn-outline-secondary" id="btnPasteIntoPage" title="Paste your clipboard into the focused field in the page">
+                <i class="bi bi-clipboard-plus"></i>
             </button>
             <div class="vr mx-1 bg-secondary opacity-25"></div>
             <button class="btn btn-sm btn-danger" id="btnCloseTab"><i class="bi bi-x-lg"></i></button>
@@ -644,6 +677,71 @@
                                     <div id="screenshotLoading" class="spinner-border text-primary position-absolute top-50 start-50" role="status" style="display: none; z-index: 100;"></div>
                                     <div id="focusHint" class="control-focus-hint position-absolute top-0 start-0 m-2 px-2 py-1 rounded small">
                                         <i class="bi bi-keyboard"></i> Click the page, then type to send keystrokes
+                                    </div>
+                                </div>
+
+                                <!-- Clipboard reads are blocked outside a secure context, which a LAN
+                                     dashboard on plain HTTP never is. This is the way that always works. -->
+                                <div id="pasteBox" class="control-paste-box d-none">
+                                    <div class="fw-bold small mb-1"><i class="bi bi-clipboard-plus"></i> Paste into the page</div>
+                                    <textarea id="pasteBoxText" class="form-control form-control-sm form-control-theme font-monospace" rows="4"
+                                              spellcheck="false" placeholder="Press Cmd/Ctrl+V here, then Send"></textarea>
+                                    <div class="d-flex justify-content-between align-items-center mt-2 gap-2">
+                                        <span class="x-small text-theme-muted">Goes to whatever the page has focused.</span>
+                                        <span class="d-flex gap-2">
+                                            <button class="btn btn-sm btn-theme-secondary" id="btnPasteCancel">Cancel</button>
+                                            <button class="btn btn-sm btn-primary" id="btnPasteSend">Send</button>
+                                        </span>
+                                    </div>
+                                </div>
+
+                                <div id="controlNotice" class="control-notice d-none"></div>
+
+                                <!-- Network panel -->
+                                <div id="networkPanel" class="network-panel d-none flex-column">
+                                    <div class="d-flex align-items-center gap-2 px-2 py-1 bg-theme-surface border-top border-bottom border-theme flex-wrap">
+                                        <span class="d-flex align-items-center gap-1 small fw-bold text-uppercase text-theme-muted">
+                                            <span id="networkStatusDot" class="status-indicator status-stopped"></span> Network
+                                        </span>
+                                        <input type="text" id="networkFilter" class="form-control form-control-sm form-control-theme"
+                                               placeholder="Filter URL" style="max-width: 180px;" autocomplete="off">
+                                        <select id="networkTypeFilter" class="form-select form-select-sm form-select-theme" style="max-width: 128px;">
+                                            <option value="">All types</option>
+                                            <option value="xhr">Fetch / XHR</option>
+                                            <option value="document">Document</option>
+                                            <option value="script">Script</option>
+                                            <option value="stylesheet">CSS</option>
+                                            <option value="image">Image</option>
+                                            <option value="other">Other</option>
+                                        </select>
+                                        <div class="form-check m-0 small text-nowrap">
+                                            <input class="form-check-input" type="checkbox" id="networkFailedOnly">
+                                            <label class="form-check-label" for="networkFailedOnly">Problems only</label>
+                                        </div>
+                                        <span class="x-small text-theme-muted ms-auto text-nowrap" id="networkCount">no requests yet</span>
+                                        <button class="btn btn-sm btn-outline-secondary" id="btnNetworkClear" title="Clear the log"><i class="bi bi-trash"></i></button>
+                                        <button class="btn btn-sm btn-outline-secondary" id="btnNetworkPanelClose" title="Stop recording and close"><i class="bi bi-x-lg"></i></button>
+                                    </div>
+                                    <div class="d-flex flex-grow-1 overflow-hidden">
+                                        <div class="network-list flex-grow-1 overflow-auto">
+                                            <table class="table table-sm table-theme network-table mb-0">
+                                                <thead>
+                                                    <tr>
+                                                        <th>Name</th>
+                                                        <th style="width: 72px;">Method</th>
+                                                        <th style="width: 70px;">Status</th>
+                                                        <th style="width: 92px;">Type</th>
+                                                        <th style="width: 80px;">Size</th>
+                                                        <th style="width: 72px;">Time</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody id="networkRows"></tbody>
+                                            </table>
+                                            <div id="networkEmpty" class="p-3 text-center text-theme-muted small">
+                                                Recording. Click around in the page and the requests land here.
+                                            </div>
+                                        </div>
+                                        <div id="networkDetail" class="network-detail d-none overflow-auto"></div>
                                     </div>
                                 </div>
                                 <!-- Status bar -->

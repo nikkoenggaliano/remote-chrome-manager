@@ -450,11 +450,148 @@ curl -H "$AUTH" "$BASE/instances/$ID/tabs/$TAB/pdf?landscape=1" -o page.pdf
 Screenshot JPEG quality follows the `SCREENSHOT_QUALITY` env var (10 to 100,
 default 60). PDF accepts `landscape=1` and `background=0`.
 
-`screenshot` also takes `scale` (0.25 to 1) and reports what it applied in the
-`X-Capture-Scale` response header. That header matters if you feed coordinates
-back in: a frame captured at `scale=0.5` is half the page's width, so a point
-read straight off the image lands at half the intended position. Divide image
-coordinates by the header value before passing them to `input` or `inspect`.
+`screenshot` also takes `scale` (0.25 to 1) and reports three response headers:
+
+| Header | Meaning |
+|---|---|
+| `X-Capture-Scale` | The scale actually applied, after clamping |
+| `X-Viewport-Width` | How many CSS pixels of page the frame covers across |
+| `X-Viewport-Height` | The same for the vertical axis |
+
+Use the viewport headers to map a point on the image back onto the page:
+
+```
+pageX = imageX * (X-Viewport-Width / imageWidth)
+```
+
+That holds whatever the scale is, and it keeps holding when the tab is
+emulating a device. Arithmetic based on the scale alone does not: a phone
+preview is captured at 390 image pixels wide while its layout viewport is 980
+CSS pixels, and a device pixel ratio above 1 multiplies the image again. Both
+of those used to put every click in the wrong place.
+
+### Device emulation
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/instances/:id/tabs/:tabId/emulation` | Current overrides, and the presets this server knows |
+| `POST` | `/instances/:id/tabs/:tabId/emulation` | Emulate a device, or go back to the real desktop browser |
+
+```bash
+# see what is available
+curl -H "$AUTH" $BASE/instances/$ID/tabs/$TAB/emulation
+
+# preview the page as a phone, and reload so the site re-renders for it
+curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"device":"mobile","preset":"pixel-7","reload":true}' \
+  $BASE/instances/$ID/tabs/$TAB/emulation
+
+# back to the real browser
+curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"device":"desktop","reload":true}' \
+  $BASE/instances/$ID/tabs/$TAB/emulation
+```
+
+Viewport, user agent, Client Hints and touch support are set together. Setting
+one without the others gives the worst of both: a site that sees a phone-sized
+window but a desktop user agent serves its desktop build into it, which looks
+broken and tells you nothing about the mobile experience.
+
+`width`, `height`, `device_scale_factor`, `mobile`, `touch` and `user_agent`
+each override the preset when you send them. `device_scale_factor` defaults to
+1 rather than the device's real ratio, because every frame is JPEG-encoded and
+scaled into a viewer anyway, so 3x costs nine times the pixels for nothing. Ask
+for it explicitly when you are capturing for keeps.
+
+`reload` is worth sending. The layout follows the viewport immediately, but a
+site that branches on the user agent only does so while loading, and touch
+support is wired up when the document is created.
+
+Overrides belong to the tab, not to the instance, and this server re-applies
+them whenever it rebuilds its CDP session for that tab, so they survive an idle
+disconnect. They do not survive the tab closing or the instance stopping.
+
+### Network log
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/instances/:id/tabs/:tabId/network/start` | Start recording this tab's traffic |
+| `GET` | `/instances/:id/tabs/:tabId/network` | Read the recorded requests |
+| `GET` | `/instances/:id/tabs/:tabId/network/:requestId` | One request, with headers and body |
+| `DELETE` | `/instances/:id/tabs/:tabId/network` | Clear the log, keep recording |
+| `POST` | `/instances/:id/tabs/:tabId/network/stop` | Stop recording and drop the log |
+
+```bash
+curl -X POST -H "$AUTH" $BASE/instances/$ID/tabs/$TAB/network/start
+
+# ... drive the page ...
+
+curl -H "$AUTH" "$BASE/instances/$ID/tabs/$TAB/network?since_seq=0"
+```
+
+```json
+{
+  "recording": true, "connected": true, "generation": 1,
+  "next_seq": 18, "total": 7, "dropped": 0, "max_entries": 500,
+  "entries": [
+    { "id": "r3", "seq": 7, "method": "POST", "url": "https://app.example.com/api/login",
+      "status": 200, "resource_type": "Fetch", "mime_type": "application/json",
+      "size_bytes": 412, "duration_ms": 93, "finished": true, "failed": false,
+      "remote_address": "10.0.0.4:443", "protocol": "h2", "has_post_data": true }
+  ]
+}
+```
+
+Nothing is recorded before `start`: there is no listener until then.
+
+Poll with `since_seq` set to the previous `next_seq` and you get only what
+changed, including entries that changed because their response arrived later.
+If `generation` differs from the one you saw, the log was cleared underneath
+you: drop what you hold and resync from `since_seq=0`.
+
+The detail endpoint adds request and response headers, the request payload, and
+the response body:
+
+```bash
+curl -H "$AUTH" $BASE/instances/$ID/tabs/$TAB/network/r3
+```
+
+Response headers are merged with the raw ones Chrome reports separately, so
+`set-cookie` is included, which the parsed event alone omits. Bodies are
+fetched from Chrome on demand and it keeps them only while it has a reason to,
+so `body_available: false` with a reason in `body_error` is an ordinary answer
+rather than a failure: a redirect hop, a 204, or a response already discarded.
+Binary bodies come back base64 with `body_base64: true`, and anything over 2 MB
+is truncated with `body_truncated: true`.
+
+A recorder holds its own CDP session for the tab and stops itself once nothing
+has polled for a couple of minutes (`NETWORK_LOG_IDLE_MS`). The buffer keeps
+the most recent `NETWORK_LOG_MAX` requests, 500 by default, and reports how
+many it had to drop.
+
+### Clipboard
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/instances/:id/tabs/:tabId/selection` | What the page has selected |
+| `POST` | `/instances/:id/tabs/:tabId/paste` | Paste text into the focused element |
+
+```bash
+curl -H "$AUTH" $BASE/instances/$ID/tabs/$TAB/selection
+# {"text":"order-8821","html":"","from_field":true,"has_selection":true}
+
+curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"text":"eyJhbGciOiJIUzI1NiJ9"}' \
+  $BASE/instances/$ID/tabs/$TAB/paste
+```
+
+A selection inside an input or textarea is reported too, which
+`window.getSelection()` on its own does not do.
+
+Paste inserts the text in one go, the way a real paste arrives, rather than
+replaying keystrokes: frameworks still get the `input` event they listen for,
+and a long string does not cost one round trip per character. Click the field
+first so it has focus.
 
 ### Synthetic input
 

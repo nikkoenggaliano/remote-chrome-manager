@@ -21,6 +21,8 @@ const chromeManager = require('./lib/chrome-manager');
 const cdpClient = require('./lib/cdp-client');
 const { parseCookieFiles } = require('./lib/cookie-import');
 const { parseSessionFiles, parseCookieMirrors } = require('./lib/session-import');
+const networkRecorder = require('./lib/network-recorder');
+const devicePresets = require('./lib/device-presets');
 const { parseChromeFlags, readStoredFlags, serializeFlags } = require('./lib/chrome-flags');
 const { runChecks } = require('./lib/dep-check');
 const { buildOpenApiSpec, documentedRoutes } = require('./lib/openapi');
@@ -910,6 +912,7 @@ async function handleUpdateInstance(req, res) {
 
 async function handleDeleteInstance(req, res) {
   const instance = getInstanceByIdOrThrow(req.params.id);
+  releaseInstanceTabState(instance);
   chromeManager.stopInstance(instance.id);
   db.prepare('DELETE FROM instances WHERE id = ?').run(instance.id);
   broadcastUpdate();
@@ -925,8 +928,17 @@ async function handleStartInstance(req, res) {
   res.json({ success: true, instance: serializeInstance(refreshed) });
 }
 
+function releaseInstanceTabState(instance) {
+  // Tabs do not survive a stopped browser, and neither should the state we
+  // keep about them: a recorder would hold a socket to a dead port, and a
+  // stale emulation entry would be re-applied to whatever tab inherited the id.
+  networkRecorder.stopForEndpoint(instance.host, instance.port);
+  cdpClient.clearEmulationForEndpoint(instance.host, instance.port);
+}
+
 async function handleStopInstance(req, res) {
   const instance = getInstanceByIdOrThrow(req.params.id);
+  releaseInstanceTabState(instance);
   chromeManager.stopInstance(instance.id);
   instanceTabCounts.delete(instance.id);
   const refreshed = getInstanceByIdOrThrow(instance.id);
@@ -1195,6 +1207,136 @@ async function handleTabPdf(req, res) {
   res.type('application/pdf').send(Buffer.from(data, 'base64'));
 }
 
+function parseIntInRange(value, fieldName, { min, max, fallback = null }) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const number = Number(value);
+  if (!Number.isFinite(number) || !Number.isInteger(number) || number < min || number > max) {
+    throw createHttpError(400, `"${fieldName}" must be a whole number between ${min} and ${max}`);
+  }
+  return number;
+}
+
+async function handleGetEmulation(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  res.json({
+    instance_id: instance.id,
+    tab_id: req.params.tabId,
+    emulation: cdpClient.getEmulation(instance.host, instance.port, req.params.tabId),
+    default_preset: devicePresets.DEFAULT_PRESET_ID,
+    presets: devicePresets.listPresets(),
+  });
+}
+
+async function handleSetEmulation(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const body = req.body || {};
+  const reload = body.reload === true || body.reload === 'true';
+
+  const requestedDevice = normalizeString(body.device).toLowerCase();
+  const wantsDesktop = requestedDevice === 'desktop' || requestedDevice === 'web' || body.device === null;
+  if (requestedDevice && !['desktop', 'web', 'mobile'].includes(requestedDevice)) {
+    throw createHttpError(400, 'device must be "desktop" or "mobile"');
+  }
+
+  if (wantsDesktop) {
+    await cdpClient.setEmulation(instance.host, instance.port, req.params.tabId, null, { reload });
+    res.json({ success: true, emulation: null, reloaded: reload, presets: devicePresets.listPresets() });
+    return;
+  }
+
+  const presetId = normalizeString(body.preset) || devicePresets.DEFAULT_PRESET_ID;
+  const preset = devicePresets.findPreset(presetId);
+  if (!preset) {
+    const known = devicePresets.listPresets().map((item) => item.id).join(', ');
+    throw createHttpError(400, `Unknown device preset "${presetId}". Known presets: ${known}`);
+  }
+
+  const userAgent = await cdpClient.getBrowserUserAgent(instance.host, instance.port);
+  const resolved = devicePresets.resolvePreset(preset, userAgent);
+
+  // Anything sent explicitly wins over the preset, so a caller can preview an
+  // arbitrary viewport without the table having to know about it.
+  const width = parseIntInRange(body.width, 'width', { min: 50, max: 10000, fallback: resolved.width });
+  const height = parseIntInRange(body.height, 'height', { min: 50, max: 10000, fallback: resolved.height });
+  const scaleFactor = body.device_scale_factor === undefined || body.device_scale_factor === null || body.device_scale_factor === ''
+    ? 1
+    : Number(body.device_scale_factor);
+  if (!Number.isFinite(scaleFactor) || scaleFactor < 0.1 || scaleFactor > 5) {
+    throw createHttpError(400, '"device_scale_factor" must be a number between 0.1 and 5');
+  }
+
+  const state = {
+    device: 'mobile',
+    preset_id: resolved.preset_id,
+    label: resolved.label,
+    width,
+    height,
+    device_scale_factor: scaleFactor,
+    mobile: body.mobile === undefined ? resolved.mobile : parseBoolean(body.mobile, 'mobile'),
+    touch: body.touch === undefined ? resolved.touch : parseBoolean(body.touch, 'touch'),
+    user_agent: normalizeString(body.user_agent) || resolved.user_agent,
+    client_hints: normalizeString(body.user_agent) ? null : resolved.client_hints,
+    applied_at: Date.now(),
+  };
+
+  await cdpClient.setEmulation(instance.host, instance.port, req.params.tabId, state, { reload });
+  res.json({ success: true, emulation: state, reloaded: reload, presets: devicePresets.listPresets() });
+}
+
+async function handleNetworkStart(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const status = await networkRecorder.start(instance.host, instance.port, req.params.tabId);
+  res.json({ success: true, ...status });
+}
+
+async function handleNetworkStop(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const stopped = networkRecorder.stop(instance.host, instance.port, req.params.tabId);
+  res.json({ success: true, stopped });
+}
+
+async function handleNetworkList(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const sinceSeq = parseIntInRange(req.query?.since_seq, 'since_seq', { min: 0, max: Number.MAX_SAFE_INTEGER, fallback: 0 });
+  const limit = parseIntInRange(req.query?.limit, 'limit', { min: 1, max: 2000, fallback: undefined });
+  const status = await networkRecorder.list(instance.host, instance.port, req.params.tabId, { sinceSeq, limit });
+  res.json({ instance_id: instance.id, tab_id: req.params.tabId, ...status });
+}
+
+async function handleNetworkClear(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const cleared = networkRecorder.clear(instance.host, instance.port, req.params.tabId);
+  res.json({ success: true, cleared });
+}
+
+async function handleNetworkRequest(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  try {
+    const detail = await networkRecorder.body(instance.host, instance.port, req.params.tabId, req.params.requestId);
+    res.json({ instance_id: instance.id, tab_id: req.params.tabId, request: detail });
+  } catch (error) {
+    if (error.code === 'NOT_RECORDING') throw createHttpError(409, error.message);
+    if (error.code === 'NO_SUCH_REQUEST') throw createHttpError(404, error.message);
+    throw error;
+  }
+}
+
+async function handleGetTabSelection(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const selection = await cdpClient.getSelection(instance.host, instance.port, req.params.tabId);
+  res.json({ instance_id: instance.id, tab_id: req.params.tabId, ...selection });
+}
+
+async function handlePasteIntoTab(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const text = req.body?.text;
+  if (typeof text !== 'string' || text === '') {
+    throw createHttpError(400, 'Send the text to paste as "text"');
+  }
+  const result = await cdpClient.insertText(instance.host, instance.port, req.params.tabId, text);
+  res.json({ success: true, ...result });
+}
+
 // The mirror of the existing cookie import: dumps every cookie in the browser
 // profile, in the same shape the import endpoint accepts, so a profile's
 // session can be moved between instances.
@@ -1220,8 +1362,8 @@ async function handleScreenshot(req, res) {
   // Chrome for exactly the resolution that will be shown costs it far less work
   // than capturing full size and throwing pixels away in the browser.
   const scale = cdpClient.clampScale(req.query?.scale ?? 1);
-  const data = await cdpClient.captureScreenshot(instance.host, instance.port, req.params.tabId, { scale });
-  if (!data) {
+  const frame = await cdpClient.captureFrame(instance.host, instance.port, req.params.tabId, { scale });
+  if (!frame || !frame.data) {
     throw createHttpError(500, 'Failed to capture screenshot');
   }
 
@@ -1230,8 +1372,18 @@ async function handleScreenshot(req, res) {
   // scale that was actually applied so the caller can convert image pixels back
   // to viewport pixels exactly.
   res.set('X-Capture-Scale', String(scale));
-  res.set('Access-Control-Expose-Headers', 'X-Capture-Scale');
-  res.type('image/jpeg').send(Buffer.from(data, 'base64'));
+  const exposed = ['X-Capture-Scale'];
+  // Scale alone stopped being enough once a tab could be emulating a phone:
+  // the device pixel ratio and the visual viewport's zoom both sit between
+  // image pixels and page pixels. These say outright how many CSS pixels of
+  // page the frame covers, which is all a click needs.
+  if (frame.viewport) {
+    res.set('X-Viewport-Width', String(Math.round(frame.viewport.width * 100) / 100));
+    res.set('X-Viewport-Height', String(Math.round(frame.viewport.height * 100) / 100));
+    exposed.push('X-Viewport-Width', 'X-Viewport-Height');
+  }
+  res.set('Access-Control-Expose-Headers', exposed.join(', '));
+  res.type('image/jpeg').send(Buffer.from(frame.data, 'base64'));
 }
 
 async function handleInput(req, res) {
@@ -1465,6 +1617,17 @@ function registerRoutes(router) {
   // inline `:param(a|b)` form.
   router.post('/instances/:id/tabs/:tabId/history/:direction', withErrorBoundary(handleTabHistory));
   router.get('/instances/:id/tabs/:tabId/pdf', withErrorBoundary(handleTabPdf));
+  router.get('/instances/:id/tabs/:tabId/emulation', withErrorBoundary(handleGetEmulation));
+  router.post('/instances/:id/tabs/:tabId/emulation', withErrorBoundary(handleSetEmulation));
+  router.get('/instances/:id/tabs/:tabId/selection', withErrorBoundary(handleGetTabSelection));
+  router.post('/instances/:id/tabs/:tabId/paste', withErrorBoundary(handlePasteIntoTab));
+  // Literal paths before the :requestId one, so "start"/"stop" cannot be read
+  // as a recorded request id.
+  router.post('/instances/:id/tabs/:tabId/network/start', withErrorBoundary(handleNetworkStart));
+  router.post('/instances/:id/tabs/:tabId/network/stop', withErrorBoundary(handleNetworkStop));
+  router.get('/instances/:id/tabs/:tabId/network', withErrorBoundary(handleNetworkList));
+  router.delete('/instances/:id/tabs/:tabId/network', withErrorBoundary(handleNetworkClear));
+  router.get('/instances/:id/tabs/:tabId/network/:requestId', withErrorBoundary(handleNetworkRequest));
   router.post('/instances/:id/cookies/import', withErrorBoundary(handleImportCookies));
   router.post('/instances/:id/session/import', withErrorBoundary(handleImportSession));
   router.get('/instances/:id/cookies', withErrorBoundary(handleExportCookies));

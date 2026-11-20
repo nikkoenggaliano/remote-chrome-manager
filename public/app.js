@@ -76,6 +76,26 @@ const liveScale = document.getElementById('liveScale');
 const streamStatusDot = document.getElementById('streamStatusDot');
 const streamStatusText = document.getElementById('streamStatusText');
 const streamLatency = document.getElementById('streamLatency');
+const btnDeviceDesktop = document.getElementById('btnDeviceDesktop');
+const btnDeviceMobile = document.getElementById('btnDeviceMobile');
+const devicePresetSelect = document.getElementById('devicePreset');
+const btnNetworkToggle = document.getElementById('btnNetworkToggle');
+const btnCopySelection = document.getElementById('btnCopySelection');
+const btnPasteIntoPage = document.getElementById('btnPasteIntoPage');
+const networkPanel = document.getElementById('networkPanel');
+const networkRows = document.getElementById('networkRows');
+const networkDetailPane = document.getElementById('networkDetail');
+const networkEmpty = document.getElementById('networkEmpty');
+const networkFilter = document.getElementById('networkFilter');
+const networkTypeFilter = document.getElementById('networkTypeFilter');
+const networkFailedOnly = document.getElementById('networkFailedOnly');
+const networkCount = document.getElementById('networkCount');
+const networkStatusDot = document.getElementById('networkStatusDot');
+const pasteBox = document.getElementById('pasteBox');
+const pasteBoxText = document.getElementById('pasteBoxText');
+const controlNotice = document.getElementById('controlNotice');
+const importSessionPaste = document.getElementById('importSessionPaste');
+const importPasteSniff = document.getElementById('importPasteSniff');
 
 // Dashboard toolbar
 const instanceSearch = document.getElementById('instanceSearch');
@@ -107,6 +127,21 @@ let streamLoopActive = false; // is the async capture loop currently running
 let controlModalOpen = false;
 let currentTabObjectUrl = null; // object URL of the frame currently shown
 let dragging = false;           // mouse drag in progress over the screenshot
+
+// Device emulation state for the tab being controlled
+let devicePresets = [];
+let defaultPresetId = null;
+let currentEmulation = null;    // null means the real desktop browser
+
+// Network panel state
+let networkOpen = false;
+let networkTabId = null;        // the tab the recorder is attached to
+let networkEntries = new Map(); // id -> entry, newest last
+let networkCursor = 0;          // last seq seen
+let networkGeneration = 0;
+let networkPollTimer = null;
+let networkSelectedId = null;
+let networkDropped = 0;
 
 // --- Init ---
 
@@ -713,6 +748,7 @@ function openImportCookies(id) {
     importCookiesInstanceName.value = inst.name || '';
     setImportCookiesResult('', 'secondary', true);
     renderImportCookieFiles([]);
+    importPasteSniff.classList.add('d-none');
     importStorageOptions.classList.add('d-none');
     importCookiesModal.show();
 
@@ -805,26 +841,66 @@ importCookiesModalEl.addEventListener('hidden.bs.modal', () => {
     importCookiesForm.reset();
     setImportCookiesResult('', 'secondary', true);
     renderImportCookieFiles([]);
+    importPasteSniff.classList.add('d-none');
     importStorageOptions.classList.add('d-none');
     setImportSubmitState(false);
 });
 
-importCookiesFilesInput.addEventListener('change', async () => {
+// A session can arrive as files, as pasted text, or as both. Everything here
+// works off that combined list so the two are never second-class to each other.
+async function collectImportSources() {
     const files = Array.from(importCookiesFilesInput.files || []);
-    renderImportCookieFiles(files);
-    // Say what each file is before anything is sent. "Unsupported JSON cookie
-    // structure" after the fact is a poor way to learn that a localStorage dump
-    // is not a cookie file.
-    const sniffed = await Promise.all(files.map(async (file) => {
+    const sources = await Promise.all(files.map(async (file) => {
         try {
-            return { file, kind: sniffSessionFile(await file.text()) };
+            return { name: file.name, content: await file.text(), file };
         } catch (error) {
-            return { file, kind: { kind: 'unknown', label: 'could not be read' } };
+            return { name: file.name, content: '', file, unreadable: true };
         }
     }));
-    renderImportCookieFiles(files, sniffed);
+
+    const pasted = importSessionPaste.value.trim();
+    if (pasted) sources.push({ name: 'pasted text', content: pasted, pasted: true });
+    return sources;
+}
+
+// Say what each source is before anything is sent. "Unsupported JSON cookie
+// structure" after the fact is a poor way to learn that a localStorage dump is
+// not a cookie file.
+async function refreshImportSources() {
+    const sources = await collectImportSources();
+    const sniffed = sources.map((source) => ({
+        ...source,
+        kind: source.unreadable
+            ? { kind: 'unknown', label: 'could not be read' }
+            : sniffSessionFile(source.content),
+    }));
+
+    const fileItems = sniffed.filter((item) => item.file);
+    renderImportCookieFiles(fileItems.map((item) => item.file), fileItems.map((item) => ({ file: item.file, kind: item.kind })));
+
+    const paste = sniffed.find((item) => item.pasted);
+    if (paste) {
+        const tone = { cookies: 'text-primary', storage: 'text-info', mixed: 'text-success', unknown: 'text-danger' };
+        importPasteSniff.className = `x-small mt-1 ${tone[paste.kind.kind] || 'text-theme-muted'}`;
+        importPasteSniff.textContent = `Pasted text reads as: ${paste.kind.label}`;
+        importPasteSniff.classList.remove('d-none');
+    } else {
+        importPasteSniff.classList.add('d-none');
+    }
+
     const needsOrigin = sniffed.some((item) => item.kind.kind === 'storage' || item.kind.kind === 'mixed');
     importStorageOptions.classList.toggle('d-none', !needsOrigin);
+    return sniffed;
+}
+
+importCookiesFilesInput.addEventListener('change', () => { refreshImportSources(); });
+
+let importPasteSniffTimer = null;
+importSessionPaste.addEventListener('input', () => {
+    // Sniffing on every keystroke of a 40 KB paste is wasted work; one pass
+    // once the pasting stops is enough.
+    clearTimeout(importPasteSniffTimer);
+    importPasteSniffTimer = setTimeout(() => refreshImportSources(), 180);
 });
 
 importCookiesForm.addEventListener('submit', async (e) => {
@@ -835,9 +911,9 @@ importCookiesForm.addEventListener('submit', async (e) => {
         return;
     }
 
-    const files = Array.from(importCookiesFilesInput.files || []);
-    if (!files.length) {
-        setImportCookiesResult('Select at least one file.', 'danger');
+    const sources = await collectImportSources();
+    if (!sources.length) {
+        setImportCookiesResult('Select a file or paste the session in.', 'danger');
         return;
     }
 
@@ -845,8 +921,7 @@ importCookiesForm.addEventListener('submit', async (e) => {
     setImportCookiesResult('', 'secondary', true);
 
     try {
-        const payloadFiles = await Promise.all(files.map(readFileAsText));
-        const payload = { files: payloadFiles };
+        const payload = { files: sources.map((source) => ({ name: source.name, content: source.content })) };
 
         if (!importStorageOptions.classList.contains('d-none')) {
             const origin = importSessionOrigin.value.trim();
@@ -974,7 +1049,12 @@ async function openControl(id, name) {
 
 function resetControlView() {
     lastCaptureScale = 1;
+    lastViewport = null;
     stopStream();
+    closeNetworkPanel({ stopRecorder: true });
+    hidePasteBox();
+    currentEmulation = null;
+    renderDeviceButtons();
     currentTabId = null;
     currentTabs = [];
     tabContent.classList.add('d-none');
@@ -1090,6 +1170,13 @@ function selectTab(id) {
     tabList.querySelectorAll('[data-tab-id]').forEach(el =>
         el.classList.toggle('active', el.getAttribute('data-tab-id') === id));
 
+    // Emulation and the network log both belong to a tab, not to the instance,
+    // so switching tabs has to re-point them or the panel would show one tab's
+    // traffic while the view shows another's.
+    lastViewport = null;
+    loadEmulation(id);
+    if (networkOpen && networkTabId !== id) startNetworkForCurrentTab();
+
     // Bring the target tab to the foreground (best effort) then start the view.
     fetchAPI(`/api/instances/${currentInstanceId}/tabs/${id}/activate`, 'POST').catch(() => {});
     if (liveEnabled) startStream();
@@ -1119,12 +1206,22 @@ function setStreamStatus(state, latencyMs) {
 // 1920, so a click read straight off the image lands less than half way across.
 let lastCaptureScale = 1;
 
+// How many CSS pixels of page the frame on screen covers, straight from the
+// server (X-Viewport-Width / -Height). Working it out from the image instead
+// only holds while the tab is an ordinary desktop one: emulate a phone and the
+// device pixel ratio and the visual viewport's zoom both come between image
+// pixels and page pixels, so a click read off the image lands somewhere else
+// entirely. Null when the server did not report it, which falls back to the
+// old arithmetic.
+let lastViewport = null;
+
 // Width of the page's viewport in CSS pixels, recovered from the frame we are
 // showing. Deriving it from naturalWidth alone is what made the old version
 // oscillate: naturalWidth is itself the *result* of the scale, so asking for a
 // smaller frame made the next computation ask for a bigger one, and the live
 // view flipped between two resolutions on every single frame.
 function viewportWidthFromFrame() {
+    if (lastViewport && lastViewport.width > 0) return lastViewport.width;
     const natural = tabScreenshot.naturalWidth;
     if (!natural) return 0;
     return natural / (lastCaptureScale || 1);
@@ -1144,6 +1241,10 @@ function currentCaptureScale() {
     return Math.min(1, Math.max(0.25, Math.ceil((shown / viewport) * 20) / 20));
 }
 
+// Longer than any healthy capture (which is tens of milliseconds) and shorter
+// than the server's own capture deadline, so the viewer recovers first.
+const FRAME_TIMEOUT_MS = 6000;
+
 async function grabAndSwap() {
     if (!currentInstanceId || !currentTabId) return false;
     // Remember which tab this frame belongs to so a late-arriving frame from a
@@ -1151,14 +1252,31 @@ async function grabAndSwap() {
     const reqInstance = currentInstanceId;
     const reqTab = currentTabId;
     const t0 = performance.now();
+    // A frame request that never answers would freeze the loop for good, since
+    // the loop waits for one frame before asking for the next. Giving up on it
+    // turns a stall into a missed frame.
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), FRAME_TIMEOUT_MS);
     try {
-        const res = await fetch(`/api/instances/${reqInstance}/tabs/${reqTab}/screenshot?scale=${currentCaptureScale()}&t=${Date.now()}`);
+        const res = await fetch(`/api/instances/${reqInstance}/tabs/${reqTab}/screenshot?scale=${currentCaptureScale()}&t=${Date.now()}`,
+            { signal: controller.signal });
         if (res.status === 401) { window.location.reload(); return false; }
         if (!res.ok) throw new Error(`screenshot ${res.status}`);
         // Recorded before the image is swapped in, so coordinate mapping and
         // the next scale decision both describe the frame actually on screen.
         const appliedScale = parseFloat(res.headers.get('X-Capture-Scale'));
         if (Number.isFinite(appliedScale) && appliedScale > 0) lastCaptureScale = appliedScale;
+        const vw = parseFloat(res.headers.get('X-Viewport-Width'));
+        const vh = parseFloat(res.headers.get('X-Viewport-Height'));
+        if (Number.isFinite(vw) && vw > 0 && Number.isFinite(vh) && vh > 0) {
+            lastViewport = { width: vw, height: vh };
+        }
+        // A frame that arrived without the headers says nothing new about the
+        // viewport - mid-navigation Chrome reports a zero-sized one, and an
+        // older server does not report it at all - so the last known size is
+        // kept rather than dropping back to arithmetic on the image, which is
+        // wrong by the device pixel ratio the moment a phone is emulated.
+        // It is cleared deliberately when the tab or the device changes.
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         await new Promise((resolve, reject) => {
@@ -1182,6 +1300,8 @@ async function grabAndSwap() {
     } catch (e) {
         if (streamLoopActive) setStreamStatus('error');
         return false;
+    } finally {
+        clearTimeout(abortTimer);
     }
 }
 
@@ -1416,6 +1536,16 @@ const sendText = (text) => postInput('text', { text });
 function toCanvasCoords(e) {
     const rect = tabScreenshot.getBoundingClientRect();
     if (!tabScreenshot.naturalWidth || !rect.width) return null;
+
+    // Preferred: the server said how much page the frame covers, so the only
+    // conversion left is panel pixels -> page pixels.
+    if (lastViewport && lastViewport.width > 0 && lastViewport.height > 0) {
+        return {
+            x: Math.round((e.clientX - rect.left) * (lastViewport.width / rect.width)),
+            y: Math.round((e.clientY - rect.top) * (lastViewport.height / rect.height)),
+        };
+    }
+
     const capture = lastCaptureScale || 1;
     const scaleX = tabScreenshot.naturalWidth / capture / rect.width;
     const scaleY = tabScreenshot.naturalHeight / capture / rect.height;
@@ -1503,6 +1633,13 @@ function openContextMenu(clientX, clientY, canvas) {
     const sep2 = document.createElement('div');
     sep2.className = 'ctx-sep';
     pageContextMenu.append(sep2);
+
+    pageContextMenu.append(contextItem('Copy selected text', 'bi-clipboard-check', () => copySelectionFromPage()));
+    pageContextMenu.append(contextItem('Paste into page', 'bi-clipboard-plus', () => pasteIntoPage()));
+
+    const sep3 = document.createElement('div');
+    sep3.className = 'ctx-sep';
+    pageContextMenu.append(sep3);
 
     pageContextMenu.append(contextItem('View loaded HTML', 'bi-filetype-html', () => openHtmlInspector(currentTabId)));
     pageContextMenu.append(contextItem('Send right-click to page', 'bi-mouse2', () => {
@@ -1688,8 +1825,31 @@ screenWrapper.addEventListener('blur', () => screenWrapper.classList.remove('has
 
 screenWrapper.addEventListener('keydown', async (e) => {
     if (!currentInstanceId || !currentTabId) return;
+    // The paste box is a real textarea floating over the view; it keeps its own
+    // keystrokes instead of sending them to the page.
+    if (e.target && e.target !== screenWrapper && e.target.closest && e.target.closest('input, textarea')) return;
 
     const hasCmdCtrl = e.ctrlKey || e.metaKey;
+
+    // Clipboard shortcuts are answered here rather than forwarded. The browser
+    // at the other end has its own clipboard that the operator cannot see or
+    // reach: a forwarded Ctrl+C would copy into that one, and a forwarded
+    // Ctrl+V would paste whatever happened to be in it.
+    if (hasCmdCtrl && !e.altKey && (e.key === 'c' || e.key === 'C')) {
+        e.preventDefault();
+        copySelectionFromPage();
+        return;
+    }
+    if (hasCmdCtrl && !e.altKey && (e.key === 'x' || e.key === 'X')) {
+        // Take a copy, then let the key through so the page does the cutting.
+        copySelectionFromPage({ quiet: true });
+    }
+    if (hasCmdCtrl && !e.altKey && (e.key === 'v' || e.key === 'V')) {
+        // Deliberately NOT prevented: letting the keystroke run is what makes
+        // the browser raise the paste event below, which carries the clipboard
+        // text with it and needs no permission, unlike clipboard.readText().
+        return;
+    }
     const printable = e.key.length === 1;
     const special = SPECIAL_KEYS[e.key];
 
@@ -1724,6 +1884,588 @@ screenWrapper.addEventListener('keydown', async (e) => {
         await sendKey({ ...base, type: 'rawKeyDown' });
         await sendKey({ ...base, type: 'keyUp' });
         nudge();
+    }
+});
+
+// --- Device emulation (Web / Mobile) --------------------------------------
+// Sites decide what to serve from the viewport, the user agent and whether
+// touch exists, so the switch sets all three together and reloads. Setting one
+// without the others produces the worst possible preview: a desktop page
+// squeezed into a phone-sized window, which looks broken and tells you nothing.
+
+function renderDeviceButtons() {
+    const mobile = Boolean(currentEmulation);
+    btnDeviceDesktop.classList.toggle('active', !mobile);
+    btnDeviceMobile.classList.toggle('active', mobile);
+    devicePresetSelect.classList.toggle('d-none', !mobile);
+    if (mobile && currentEmulation.preset_id) devicePresetSelect.value = currentEmulation.preset_id;
+
+    // Show the device at its own size. The frame is scaled to fit the panel by
+    // default, which is right for a desktop page and useless for a phone: a
+    // 393 px page stretched across 1100 px of panel looks nothing like the
+    // thing you are trying to preview.
+    tabScreenshot.style.maxWidth = mobile ? `${currentEmulation.width}px` : '';
+    tabScreenshot.classList.toggle('device-frame', mobile);
+    btnDeviceMobile.title = mobile
+        ? `Emulating ${currentEmulation.label} (${currentEmulation.width}x${currentEmulation.height})`
+        : 'Emulate a phone: viewport, user agent and touch together, then reload so the site re-renders';
+}
+
+function populatePresetOptions() {
+    const current = devicePresetSelect.value;
+    devicePresetSelect.innerHTML = devicePresets
+        .map((preset) => `<option value="${escapeAttr(preset.id)}">${escapeHtml(preset.label)} ${preset.width}x${preset.height}</option>`)
+        .join('');
+    const keep = devicePresets.some((preset) => preset.id === current) ? current : defaultPresetId;
+    if (keep) devicePresetSelect.value = keep;
+}
+
+async function loadEmulation(tabId) {
+    if (!currentInstanceId || !tabId) return;
+    try {
+        const res = await fetchJsonOrThrow(`/api/instances/${currentInstanceId}/tabs/${tabId}/emulation`);
+        // The answer is about one tab; by the time it lands the operator may
+        // have moved to another one.
+        if (currentTabId !== tabId) return;
+        devicePresets = res.presets || [];
+        defaultPresetId = res.default_preset || (devicePresets[0] && devicePresets[0].id) || null;
+        populatePresetOptions();
+        currentEmulation = res.emulation || null;
+        renderDeviceButtons();
+    } catch (error) {
+        // A tab that cannot report its emulation still controls fine; leaving
+        // the switch alone is better than guessing.
+    }
+}
+
+let deviceSwitchBusy = false;
+async function applyDevice(device, presetId) {
+    if (!currentInstanceId || !currentTabId || deviceSwitchBusy) return;
+    deviceSwitchBusy = true;
+    btnDeviceDesktop.disabled = true;
+    btnDeviceMobile.disabled = true;
+    devicePresetSelect.disabled = true;
+
+    const payload = device === 'desktop'
+        ? { device: 'desktop', reload: true }
+        : { device: 'mobile', preset: presetId || devicePresetSelect.value || defaultPresetId, reload: true };
+
+    try {
+        const res = await fetchJsonOrThrow(`/api/instances/${currentInstanceId}/tabs/${currentTabId}/emulation`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        currentEmulation = res.emulation || null;
+        renderDeviceButtons();
+        // The frame is about to change shape, and the old viewport reading
+        // would map clicks wrongly until the next one arrives.
+        lastViewport = null;
+        showControlNotice(currentEmulation
+            ? `Showing ${currentEmulation.label} - ${currentEmulation.width}x${currentEmulation.height}, reloaded`
+            : 'Back to the real desktop browser', 'good');
+        nudge(600);
+    } catch (error) {
+        showControlNotice(error.message || 'Could not switch device', 'bad');
+    } finally {
+        deviceSwitchBusy = false;
+        btnDeviceDesktop.disabled = false;
+        btnDeviceMobile.disabled = false;
+        devicePresetSelect.disabled = false;
+    }
+}
+
+btnDeviceDesktop.addEventListener('click', () => { if (currentEmulation) applyDevice('desktop'); });
+btnDeviceMobile.addEventListener('click', () => applyDevice('mobile'));
+devicePresetSelect.addEventListener('change', () => applyDevice('mobile', devicePresetSelect.value));
+
+// --- Clipboard across the wire --------------------------------------------
+// The controlled browser has its own clipboard, which the operator can neither
+// see nor reach, so Ctrl+C and Ctrl+V are answered here instead of being
+// forwarded: a copy reads the page's selection and puts it on the local
+// clipboard, a paste takes the local clipboard and types it into the page.
+
+let controlNoticeTimer = null;
+function showControlNotice(message, tone = '') {
+    if (!controlNotice) return;
+    controlNotice.textContent = message;
+    controlNotice.className = `control-notice${tone ? ` is-${tone}` : ''}`;
+    clearTimeout(controlNoticeTimer);
+    controlNoticeTimer = setTimeout(() => controlNotice.classList.add('d-none'), 3200);
+}
+
+// navigator.clipboard needs a secure context, which a dashboard served over
+// plain HTTP on a LAN address never has. execCommand still works there, and is
+// the reason this is not a one-liner.
+async function writeClipboardText(text) {
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch (error) { /* fall through to the old way */ }
+
+    try {
+        const holder = document.createElement('textarea');
+        holder.value = text;
+        holder.setAttribute('readonly', '');
+        holder.style.position = 'fixed';
+        holder.style.opacity = '0';
+        document.body.appendChild(holder);
+        holder.select();
+        const ok = document.execCommand('copy');
+        holder.remove();
+        return ok;
+    } catch (error) {
+        return false;
+    }
+}
+
+async function copySelectionFromPage(options = {}) {
+    if (!currentInstanceId || !currentTabId) return;
+    try {
+        const res = await fetchJsonOrThrow(`/api/instances/${currentInstanceId}/tabs/${currentTabId}/selection`);
+        if (!res.has_selection) {
+            if (!options.quiet) showControlNotice('Nothing is selected in the page. Drag across some text first.', 'bad');
+            return;
+        }
+        const copied = await writeClipboardText(res.text);
+        if (copied) {
+            showControlNotice(`Copied ${res.text.length} characters from the page`, 'good');
+        } else {
+            // Last resort: show it so it can be selected by hand rather than
+            // claiming a copy that did not happen.
+            showPasteBox(res.text, { readingBack: true });
+            showControlNotice('Your browser blocked the clipboard here, so the text is shown instead', 'bad');
+        }
+    } catch (error) {
+        showControlNotice(error.message || 'Could not read the selection', 'bad');
+    }
+}
+
+async function sendPasteText(text) {
+    if (!text || !currentInstanceId || !currentTabId) return;
+    try {
+        await fetchJsonOrThrow(`/api/instances/${currentInstanceId}/tabs/${currentTabId}/paste`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text }),
+        });
+        showControlNotice(`Pasted ${text.length} characters into the page`, 'good');
+        nudge(150);
+    } catch (error) {
+        showControlNotice(error.message || 'Paste failed', 'bad');
+    }
+}
+
+async function pasteIntoPage() {
+    if (!currentInstanceId || !currentTabId) return;
+    try {
+        if (navigator.clipboard && window.isSecureContext && navigator.clipboard.readText) {
+            const text = await navigator.clipboard.readText();
+            if (text) {
+                await sendPasteText(text);
+                return;
+            }
+        }
+    } catch (error) { /* blocked or denied: use the box below */ }
+    showPasteBox('');
+}
+
+function showPasteBox(prefill = '', options = {}) {
+    pasteBox.classList.remove('d-none');
+    pasteBoxText.value = prefill;
+    pasteBox.querySelector('#btnPasteSend').classList.toggle('d-none', Boolean(options.readingBack));
+    pasteBox.querySelector('.fw-bold').innerHTML = options.readingBack
+        ? '<i class="bi bi-clipboard-check"></i> Text from the page'
+        : '<i class="bi bi-clipboard-plus"></i> Paste into the page';
+    pasteBoxText.focus();
+    if (options.readingBack) pasteBoxText.select();
+}
+
+function hidePasteBox() {
+    pasteBox.classList.add('d-none');
+    pasteBoxText.value = '';
+}
+
+document.getElementById('btnPasteCancel').addEventListener('click', hidePasteBox);
+document.getElementById('btnPasteSend').addEventListener('click', async () => {
+    const text = pasteBoxText.value;
+    hidePasteBox();
+    screenWrapper.focus();
+    await sendPasteText(text);
+});
+pasteBoxText.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); hidePasteBox(); screenWrapper.focus(); }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); document.getElementById('btnPasteSend').click(); }
+});
+
+btnCopySelection.addEventListener('click', () => copySelectionFromPage());
+btnPasteIntoPage.addEventListener('click', () => pasteIntoPage());
+
+// A real paste event carries the clipboard with it and needs no permission,
+// which is the only way to read it on a plain-HTTP dashboard.
+document.addEventListener('paste', (e) => {
+    if (!controlModalOpen || !currentTabId) return;
+    if (!pasteBox.classList.contains('d-none')) return;   // the box takes its own
+    const inControl = document.activeElement === screenWrapper || screenWrapper.classList.contains('has-focus');
+    if (!inControl) return;
+    const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+    if (!text) return;
+    e.preventDefault();
+    sendPasteText(text);
+});
+
+// --- Network panel ---------------------------------------------------------
+
+const NETWORK_POLL_MS = 1200;
+let networkInstanceId = null;
+let networkRenderSignature = '';
+
+function setNetworkStatus(state) {
+    const map = {
+        idle: 'status-stopped',
+        loading: 'status-partial',
+        live: 'streaming',
+        error: 'status-stopped',
+    };
+    networkStatusDot.className = `status-indicator ${map[state] || map.idle}`;
+}
+
+function resetNetworkBuffer() {
+    networkEntries = new Map();
+    networkCursor = 0;
+    networkGeneration = 0;
+    networkDropped = 0;
+    networkSelectedId = null;
+    networkRenderSignature = '';
+    networkRows.innerHTML = '';
+    networkDetailPane.classList.add('d-none');
+    networkDetailPane.innerHTML = '';
+    networkEmpty.classList.remove('d-none');
+    networkEmpty.textContent = 'Recording. Click around in the page and the requests land here.';
+    networkCount.textContent = 'no requests yet';
+}
+
+function openNetworkPanel() {
+    networkOpen = true;
+    networkPanel.classList.remove('d-none');
+    networkPanel.classList.add('d-flex');
+    btnNetworkToggle.classList.add('active');
+    startNetworkForCurrentTab();
+}
+
+function closeNetworkPanel(options = {}) {
+    const { stopRecorder = true } = options;
+    const previousInstance = networkInstanceId;
+    const previousTab = networkTabId;
+
+    networkOpen = false;
+    networkPanel.classList.add('d-none');
+    networkPanel.classList.remove('d-flex');
+    btnNetworkToggle.classList.remove('active');
+    stopNetworkPoll();
+    setNetworkStatus('idle');
+    networkInstanceId = null;
+    networkTabId = null;
+
+    // The ids are captured above because this also runs as the control modal
+    // closes, by which time the current instance is already cleared.
+    if (stopRecorder && previousInstance && previousTab) {
+        fetchAPI(`/api/instances/${previousInstance}/tabs/${previousTab}/network/stop`, 'POST').catch(() => {});
+    }
+}
+
+async function startNetworkForCurrentTab() {
+    if (!currentInstanceId || !currentTabId) return;
+
+    if (networkInstanceId && networkTabId && networkTabId !== currentTabId) {
+        const previousInstance = networkInstanceId;
+        const previousTab = networkTabId;
+        fetchAPI(`/api/instances/${previousInstance}/tabs/${previousTab}/network/stop`, 'POST').catch(() => {});
+    }
+
+    networkInstanceId = currentInstanceId;
+    networkTabId = currentTabId;
+    resetNetworkBuffer();
+    setNetworkStatus('loading');
+
+    try {
+        const status = await fetchJsonOrThrow(`/api/instances/${currentInstanceId}/tabs/${currentTabId}/network/start`, { method: 'POST' });
+        networkGeneration = status.generation;
+        setNetworkStatus('live');
+        startNetworkPoll();
+    } catch (error) {
+        setNetworkStatus('error');
+        networkEmpty.textContent = `Could not start recording: ${error.message}`;
+        networkEmpty.classList.remove('d-none');
+    }
+}
+
+function startNetworkPoll() {
+    stopNetworkPoll();
+    pollNetwork();
+    networkPollTimer = setInterval(pollNetwork, NETWORK_POLL_MS);
+}
+
+function stopNetworkPoll() {
+    if (networkPollTimer) clearInterval(networkPollTimer);
+    networkPollTimer = null;
+}
+
+async function pollNetwork() {
+    if (!networkOpen || !networkInstanceId || !networkTabId) return;
+    try {
+        const res = await fetchJsonOrThrow(
+            `/api/instances/${networkInstanceId}/tabs/${networkTabId}/network?since_seq=${networkCursor}&limit=500`);
+        if (!networkOpen) return;
+
+        if (!res.recording) {
+            // The recorder stopped on its own: the tab went away, or the
+            // instance did. Say so instead of showing a log frozen in time.
+            setNetworkStatus('error');
+            networkEmpty.textContent = 'Recording stopped. Close and reopen the panel to start again.';
+            networkEmpty.classList.remove('d-none');
+            stopNetworkPoll();
+            return;
+        }
+
+        // A cleared log is a different log; keeping the old rows would mean
+        // showing entries that can never be updated again.
+        if (networkGeneration && res.generation !== networkGeneration) {
+            resetNetworkBuffer();
+            networkGeneration = res.generation;
+            return;
+        }
+        networkGeneration = res.generation;
+
+        for (const entry of res.entries) {
+            networkEntries.set(entry.id, { ...(networkEntries.get(entry.id) || {}), ...entry });
+        }
+        networkCursor = res.next_seq;
+        networkDropped = res.dropped;
+
+        const cap = res.max_entries || 500;
+        while (networkEntries.size > cap) {
+            networkEntries.delete(networkEntries.keys().next().value);
+        }
+
+        setNetworkStatus(res.connected ? 'live' : 'error');
+        renderNetworkRows();
+    } catch (error) {
+        setNetworkStatus('error');
+    }
+}
+
+function networkTypeBucket(entry) {
+    const type = String(entry.resource_type || '').toLowerCase();
+    if (type === 'xhr' || type === 'fetch' || type === 'eventsource' || type === 'websocket') return 'xhr';
+    if (type === 'document') return 'document';
+    if (type === 'script') return 'script';
+    if (type === 'stylesheet') return 'stylesheet';
+    if (type === 'image' || type === 'media' || type === 'font') return 'image';
+    return 'other';
+}
+
+function networkMatches(entry) {
+    const text = networkFilter.value.trim().toLowerCase();
+    if (text && !entry.url.toLowerCase().includes(text)) return false;
+    const type = networkTypeFilter.value;
+    if (type && networkTypeBucket(entry) !== type) return false;
+    if (networkFailedOnly.checked && !(entry.failed || (entry.status && entry.status >= 400))) return false;
+    return true;
+}
+
+function networkStatusCell(entry) {
+    if (entry.failed) return `<span class="text-danger" title="${escapeAttr(entry.error_text || 'Failed')}">failed</span>`;
+    if (entry.status === null || entry.status === undefined) return '<span class="text-theme-muted">...</span>';
+    const tone = entry.status >= 500 ? 'text-danger'
+        : entry.status >= 400 ? 'text-warning'
+        : entry.status >= 300 ? 'text-info'
+        : 'text-success';
+    return `<span class="${tone}">${entry.status}</span>`;
+}
+
+function networkNameCell(entry) {
+    let path = entry.url;
+    let host = '';
+    try {
+        const url = new URL(entry.url);
+        host = url.host;
+        path = `${url.pathname}${url.search}` || '/';
+    } catch (error) { /* data: and blob: URLs have no host */ }
+    const icon = entry.from_cache ? 'bi-archive' : (entry.failed ? 'bi-exclamation-octagon' : 'bi-arrow-left-right');
+    return `<div class="network-name"><i class="bi ${icon} opacity-50"></i>
+                <span class="net-path">${escapeHtml(path)}</span>
+                <span class="net-host">${escapeHtml(host)}</span></div>`;
+}
+
+function renderNetworkRows() {
+    const all = [...networkEntries.values()];
+    const rows = all.filter(networkMatches);
+
+    const signature = `${rows.map((e) => `${e.id}:${e.seq}`).join(',')}|${networkSelectedId}`;
+    if (signature === networkRenderSignature) return;
+    networkRenderSignature = signature;
+
+    const list = networkRows.closest('.network-list');
+    const atBottom = list ? (list.scrollHeight - list.scrollTop - list.clientHeight) < 40 : false;
+
+    networkRows.innerHTML = rows.map((entry) => `
+        <tr data-net-id="${escapeAttr(entry.id)}"
+            class="${entry.id === networkSelectedId ? 'active' : ''} ${entry.failed ? 'net-failed' : (entry.status >= 400 ? 'net-warn' : '')}">
+            <td title="${escapeAttr(entry.url)}">${networkNameCell(entry)}</td>
+            <td class="font-monospace">${escapeHtml(entry.method)}</td>
+            <td class="font-monospace">${networkStatusCell(entry)}</td>
+            <td class="text-theme-muted">${escapeHtml(entry.resource_type || '')}</td>
+            <td class="font-monospace text-theme-muted">${entry.from_cache ? 'cache' : (entry.size_bytes ? formatBytes(entry.size_bytes) : '-')}</td>
+            <td class="font-monospace text-theme-muted">${entry.duration_ms === null || entry.duration_ms === undefined ? '-' : `${entry.duration_ms} ms`}</td>
+        </tr>`).join('');
+
+    networkEmpty.classList.toggle('d-none', rows.length > 0);
+    if (!rows.length && all.length) {
+        networkEmpty.textContent = `${all.length} request(s) recorded, none match the filter.`;
+    }
+
+    const dropped = networkDropped ? `, ${networkDropped} dropped` : '';
+    networkCount.textContent = rows.length === all.length
+        ? `${all.length} request(s)${dropped}`
+        : `${rows.length} of ${all.length}${dropped}`;
+
+    // Follow the tail the way a console does, but only if the operator was
+    // already at the bottom; yanking the list while they read it is worse than
+    // missing the newest row.
+    if (atBottom && list) list.scrollTop = list.scrollHeight;
+}
+
+networkRows.addEventListener('click', (e) => {
+    const row = e.target.closest('[data-net-id]');
+    if (!row) return;
+    showNetworkDetail(row.getAttribute('data-net-id'));
+});
+
+[networkFilter, networkTypeFilter, networkFailedOnly].forEach((el) => {
+    el.addEventListener('input', () => { networkRenderSignature = ''; renderNetworkRows(); });
+    el.addEventListener('change', () => { networkRenderSignature = ''; renderNetworkRows(); });
+});
+
+function headerRows(headers) {
+    if (!headers || !Object.keys(headers).length) return '<span class="text-theme-muted">none recorded</span>';
+    return `<div class="net-kv">${Object.entries(headers)
+        .map(([name, value]) => `<span>${escapeHtml(name)}</span><span>${escapeHtml(String(value))}</span>`)
+        .join('')}</div>`;
+}
+
+function prettyBody(request) {
+    if (!request.body_available) {
+        return `<span class="text-theme-muted">${escapeHtml(request.body_error || 'No body kept for this request.')}</span>`;
+    }
+    if (request.body_base64 && /^image\//.test(request.mime_type || '')) {
+        return `<img src="data:${escapeAttr(request.mime_type)};base64,${request.body}" alt="response" style="max-width:100%;border-radius:4px;">`;
+    }
+    if (request.body_base64) {
+        return `<pre>${escapeHtml(request.body.slice(0, 4000))}</pre><div class="text-theme-muted x-small mt-1">Base64 of a binary response.</div>`;
+    }
+    let text = request.body || '';
+    if (/json/i.test(request.mime_type || '')) {
+        try { text = JSON.stringify(JSON.parse(text), null, 2); } catch (error) { /* leave it raw */ }
+    }
+    return `<pre>${escapeHtml(text)}</pre>${request.body_truncated ? '<div class="text-theme-muted x-small mt-1">Truncated at 2 MB.</div>' : ''}`;
+}
+
+// A request someone wants to look at twice is usually one they want to replay
+// in a terminal, so hand it over in the form that does that.
+function toCurl(request) {
+    const parts = [`curl -i -X ${request.method}`, `'${request.url.replace(/'/g, "'\\''")}'`];
+    for (const [name, value] of Object.entries(request.request_headers || {})) {
+        if (/^:/.test(name)) continue; // HTTP/2 pseudo-headers are not real headers
+        parts.push(`-H '${`${name}: ${value}`.replace(/'/g, "'\\''")}'`);
+    }
+    if (request.post_data) parts.push(`--data-raw '${request.post_data.replace(/'/g, "'\\''")}'`);
+    return parts.join(' \\\n  ');
+}
+
+async function showNetworkDetail(id) {
+    networkSelectedId = id;
+    networkRenderSignature = '';
+    renderNetworkRows();
+    networkDetailPane.classList.remove('d-none');
+    networkDetailPane.innerHTML = '<div class="p-3 text-theme-muted small">Loading...</div>';
+
+    try {
+        const res = await fetchJsonOrThrow(
+            `/api/instances/${networkInstanceId}/tabs/${networkTabId}/network/${encodeURIComponent(id)}`);
+        if (networkSelectedId !== id) return;
+        renderNetworkDetail(res.request);
+    } catch (error) {
+        networkDetailPane.innerHTML = `<div class="p-3 text-danger small">${escapeHtml(error.message || 'Could not load the request')}</div>`;
+    }
+}
+
+function renderNetworkDetail(request) {
+    const started = request.started_at ? new Date(request.started_at).toLocaleTimeString() : '-';
+    networkDetailPane.innerHTML = `
+        <div class="p-2 border-bottom border-theme d-flex gap-2 align-items-center bg-theme-surface position-sticky top-0">
+            <span class="badge bg-secondary">${escapeHtml(request.method)}</span>
+            <span class="small text-truncate flex-grow-1" title="${escapeAttr(request.url)}">${escapeHtml(request.url)}</span>
+            <button class="btn btn-sm btn-outline-secondary" id="btnNetCopyCurl" title="Copy as a curl command"><i class="bi bi-terminal"></i></button>
+            <button class="btn btn-sm btn-outline-secondary" id="btnNetCopyBody" title="Copy the response body"><i class="bi bi-clipboard"></i></button>
+            <button class="btn btn-sm btn-outline-secondary" id="btnNetCloseDetail" title="Close"><i class="bi bi-x-lg"></i></button>
+        </div>
+        <div class="p-2">
+            <h6>General</h6>
+            <div class="net-kv mb-3">
+                <span>Status</span><span>${request.failed ? `failed: ${escapeHtml(request.error_text || '')}` : `${request.status ?? '-'} ${escapeHtml(request.status_text || '')}`}</span>
+                <span>Type</span><span>${escapeHtml(request.resource_type || '-')}${request.mime_type ? ` (${escapeHtml(request.mime_type)})` : ''}</span>
+                <span>Remote</span><span>${escapeHtml(request.remote_address || '-')} ${escapeHtml(request.protocol || '')}</span>
+                <span>Size</span><span>${request.from_cache ? 'from cache' : (request.size_bytes ? formatBytes(request.size_bytes) : '-')}</span>
+                <span>Time</span><span>${request.duration_ms === null || request.duration_ms === undefined ? '-' : `${request.duration_ms} ms`}</span>
+                <span>Started</span><span>${escapeHtml(started)}</span>
+                ${request.redirected_to ? `<span>Redirects to</span><span>${escapeHtml(request.redirected_to)}</span>` : ''}
+                ${request.initiator ? `<span>Initiator</span><span>${escapeHtml(request.initiator.type || '')} ${escapeHtml(request.initiator.url || '')}</span>` : ''}
+            </div>
+
+            <h6>Request headers</h6>
+            <div class="mb-3">${headerRows(request.request_headers)}</div>
+
+            ${request.post_data ? `<h6>Payload</h6><div class="mb-3"><pre>${escapeHtml(request.post_data)}</pre>${request.post_data_truncated ? '<div class="text-theme-muted x-small mt-1">Truncated.</div>' : ''}</div>` : ''}
+
+            <h6>Response headers</h6>
+            <div class="mb-3">${headerRows(request.response_headers)}</div>
+
+            <h6>Response body</h6>
+            <div>${prettyBody(request)}</div>
+        </div>`;
+
+    document.getElementById('btnNetCloseDetail').addEventListener('click', () => {
+        networkDetailPane.classList.add('d-none');
+        networkSelectedId = null;
+        networkRenderSignature = '';
+        renderNetworkRows();
+    });
+    document.getElementById('btnNetCopyCurl').addEventListener('click', async () => {
+        const ok = await writeClipboardText(toCurl(request));
+        showControlNotice(ok ? 'curl command copied' : 'The browser blocked the clipboard here', ok ? 'good' : 'bad');
+    });
+    document.getElementById('btnNetCopyBody').addEventListener('click', async () => {
+        if (!request.body_available) { showControlNotice('This request has no body to copy', 'bad'); return; }
+        const ok = await writeClipboardText(request.body || '');
+        showControlNotice(ok ? 'Response body copied' : 'The browser blocked the clipboard here', ok ? 'good' : 'bad');
+    });
+}
+
+btnNetworkToggle.addEventListener('click', () => {
+    if (networkOpen) closeNetworkPanel();
+    else openNetworkPanel();
+});
+document.getElementById('btnNetworkPanelClose').addEventListener('click', () => closeNetworkPanel());
+document.getElementById('btnNetworkClear').addEventListener('click', async () => {
+    if (!networkInstanceId || !networkTabId) return;
+    try {
+        await fetchJsonOrThrow(`/api/instances/${networkInstanceId}/tabs/${networkTabId}/network`, { method: 'DELETE' });
+        resetNetworkBuffer();
+    } catch (error) {
+        showControlNotice(error.message || 'Could not clear the log', 'bad');
     }
 });
 
@@ -2063,10 +2805,6 @@ function setImportSubmitState(isLoading) {
     importCookiesSubmitBtn.innerHTML = isLoading
         ? '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Importing...'
         : 'Import';
-}
-async function readFileAsText(file) {
-    const content = await file.text();
-    return { name: file.name, content };
 }
 function formatCookieImportSummary(result) {
     const fileCount = (Array.isArray(result.files) ? result.files.length : 0) + (Array.isArray(result.file_errors) ? result.file_errors.length : 0);
