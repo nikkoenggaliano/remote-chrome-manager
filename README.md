@@ -24,8 +24,11 @@ Chrome Fleet Control is a dashboard for managing multiple Chrome or Chromium ins
   together from a device preset, so a site serves its real mobile build rather than its
   desktop one squeezed into a narrow window
 - **Network panel** per tab, like a browser's own: requests as they happen, with status,
-  type, size and timing, filters, and a detail pane carrying request and response headers
-  (`set-cookie` included), the payload, the response body, and a copy-as-curl button
+  type, size and timing, and filters. Clicking a row opens it in a popup carrying the
+  request and response headers (`set-cookie` included), the payload and the response body,
+  with next/previous buttons (or the arrow keys) to walk the list, a copy button on the
+  payload and on the response body (plus copy-as-curl in the header), and Escape or the
+  X to close
 - **Copy and paste across the wire**: Ctrl+C takes the page's selection to your clipboard
   and Ctrl+V types yours into the page, with a fallback box for the plain-HTTP LAN case
   where browsers refuse clipboard access

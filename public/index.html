@@ -741,7 +741,6 @@
                                                 Recording. Click around in the page and the requests land here.
                                             </div>
                                         </div>
-                                        <div id="networkDetail" class="network-detail d-none overflow-auto"></div>
                                     </div>
                                 </div>
                                 <!-- Status bar -->
@@ -760,6 +759,62 @@
                             </div>
                         </div>
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Request detail popup -----------------------------------------------
+             A click in the log opens the request here, over the whole control
+             view, instead of in a narrow column beside the list: headers and a
+             response body need the room to be readable at all.
+
+             It is a child of #controlModal on purpose rather than of <body>:
+             Bootstrap keeps a focus trap on the open modal that pulls focus
+             back inside it the instant anything outside asks for it, which
+             silently breaks both keyboard use and copying to the clipboard. -->
+        <div id="networkRequestModal" class="net-modal d-none">
+            <div class="net-modal-backdrop" data-net-dismiss="1"></div>
+            <div class="net-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="netModalUrl" tabindex="-1">
+                <div class="net-modal-header">
+                    <span class="badge bg-secondary flex-shrink-0" id="netModalMethod">GET</span>
+                    <div class="net-modal-head-main">
+                        <div class="net-modal-url font-monospace text-truncate" id="netModalUrl">—</div>
+                        <div class="x-small text-theme-muted text-truncate" id="netModalMeta"></div>
+                    </div>
+                    <div class="btn-group btn-group-sm flex-shrink-0">
+                        <button type="button" class="btn btn-outline-secondary" id="btnNetPrev" title="Previous request (left arrow)">
+                            <i class="bi bi-chevron-left"></i>
+                        </button>
+                        <button type="button" class="btn btn-outline-secondary" id="btnNetNext" title="Next request (right arrow)">
+                            <i class="bi bi-chevron-right"></i>
+                        </button>
+                    </div>
+                    <span class="x-small text-theme-muted font-monospace flex-shrink-0" id="netModalPosition">—</span>
+                    <div class="vr mx-1 bg-secondary opacity-25 flex-shrink-0"></div>
+                    <button type="button" class="btn btn-sm btn-outline-secondary flex-shrink-0" id="btnNetCopyCurl" title="Copy as a curl command">
+                        <i class="bi bi-terminal"></i>
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary flex-shrink-0" id="btnNetCopyBody" title="Copy the response body">
+                        <i class="bi bi-clipboard"></i>
+                    </button>
+                    <button type="button" class="btn btn-sm btn-outline-danger flex-shrink-0" id="btnNetModalClose" title="Close (Esc)" aria-label="Close">
+                        <i class="bi bi-x-lg"></i>
+                    </button>
+                </div>
+                <div class="net-modal-body" id="netModalBody"></div>
+                <!-- Only ever shown when the browser refuses to write the
+                     clipboard, which is every plain-HTTP origin. Claiming a
+                     copy that did not happen is worse than handing the text
+                     over to be copied by hand. -->
+                <div class="net-modal-foot d-none" id="netModalFallback">
+                    <div class="d-flex align-items-center gap-2 mb-1">
+                        <span class="x-small fw-bold text-uppercase text-theme-muted flex-grow-1" id="netModalFallbackLabel">
+                            Your browser blocked the clipboard - press Cmd/Ctrl+C here
+                        </span>
+                        <button type="button" class="btn btn-sm btn-theme-secondary" id="btnNetFallbackHide">Hide</button>
+                    </div>
+                    <textarea id="netModalFallbackText" class="form-control form-control-sm form-control-theme font-monospace"
+                              rows="4" spellcheck="false" readonly></textarea>
                 </div>
             </div>
         </div>

@@ -84,8 +84,19 @@ const btnCopySelection = document.getElementById('btnCopySelection');
 const btnPasteIntoPage = document.getElementById('btnPasteIntoPage');
 const networkPanel = document.getElementById('networkPanel');
 const networkRows = document.getElementById('networkRows');
-const networkDetailPane = document.getElementById('networkDetail');
 const networkEmpty = document.getElementById('networkEmpty');
+const networkRequestModal = document.getElementById('networkRequestModal');
+const netModalDialog = networkRequestModal.querySelector('.net-modal-dialog');
+const netModalMethod = document.getElementById('netModalMethod');
+const netModalUrl = document.getElementById('netModalUrl');
+const netModalMeta = document.getElementById('netModalMeta');
+const netModalPosition = document.getElementById('netModalPosition');
+const netModalBody = document.getElementById('netModalBody');
+const netModalFallback = document.getElementById('netModalFallback');
+const netModalFallbackText = document.getElementById('netModalFallbackText');
+const netModalFallbackLabel = document.getElementById('netModalFallbackLabel');
+const btnNetPrev = document.getElementById('btnNetPrev');
+const btnNetNext = document.getElementById('btnNetNext');
 const networkFilter = document.getElementById('networkFilter');
 const networkTypeFilter = document.getElementById('networkTypeFilter');
 const networkFailedOnly = document.getElementById('networkFailedOnly');
@@ -142,6 +153,11 @@ let networkGeneration = 0;
 let networkPollTimer = null;
 let networkSelectedId = null;
 let networkDropped = 0;
+let networkVisibleIds = [];      // ids in the order the list shows them
+let networkModalOpen = false;
+let networkModalRequest = null;  // the request the popup is showing
+let networkModalToken = 0;       // drops the answer to a superseded fetch
+let networkModalOpener = null;   // element to hand focus back to on close
 
 // --- Init ---
 
@@ -1490,13 +1506,14 @@ document.getElementById('btnHtmlRefresh').addEventListener('click', () => {
 
 document.getElementById('btnHtmlCopy').addEventListener('click', async () => {
     if (!htmlInspectorSource) return;
-    try {
-        await navigator.clipboard.writeText(htmlInspectorSource);
+    // Through writeClipboardText, not navigator.clipboard: that one does not
+    // exist at all on a plain-HTTP origin, which is where this dashboard
+    // usually lives.
+    if (await writeClipboardText(htmlInspectorSource)) {
         htmlModalNotice.className = 'alert alert-success rounded-0 mb-0 small';
         htmlModalNotice.innerText = 'Full HTML copied to clipboard.';
         htmlModalNotice.classList.remove('d-none');
-    } catch {
-        // Clipboard needs a secure context; plain HTTP on a LAN address has none.
+    } else {
         htmlModalNotice.className = 'alert alert-warning rounded-0 mb-0 small';
         htmlModalNotice.innerText = 'Clipboard is blocked by the browser here — use Download instead.';
         htmlModalNotice.classList.remove('d-none');
@@ -1702,9 +1719,10 @@ async function clearHighlight() {
 async function copySelectorAtPoint(point) {
     try {
         const res = await requestInspect(point, false);
-        await navigator.clipboard.writeText(res.node.selector);
+        const ok = await writeClipboardText(res.node.selector);
+        showControlNotice(ok ? `Copied ${res.node.selector}` : 'Your browser blocked the clipboard here', ok ? 'good' : 'bad');
     } catch (e) {
-        alert(`Could not copy the selector: ${e.message}`);
+        showControlNotice(`Could not copy the selector: ${e.message}`, 'bad');
     }
 }
 
@@ -1773,17 +1791,13 @@ async function inspectAtPoint(point) {
 
 document.getElementById('btnInspectCopySelector').addEventListener('click', async () => {
     if (!inspectedNode) return;
-    try {
-        await navigator.clipboard.writeText(inspectedNode.selector);
-        inspectNotice('success', 'Selector copied.');
-    } catch { inspectNotice('warning', 'Clipboard blocked by the browser here.'); }
+    if (await writeClipboardText(inspectedNode.selector)) inspectNotice('success', 'Selector copied.');
+    else inspectNotice('warning', 'Clipboard blocked by the browser here.');
 });
 document.getElementById('btnInspectCopyHtml').addEventListener('click', async () => {
     if (!inspectedNode) return;
-    try {
-        await navigator.clipboard.writeText(inspectedNode.outer_html);
-        inspectNotice('success', 'outerHTML copied.');
-    } catch { inspectNotice('warning', 'Clipboard blocked by the browser here.'); }
+    if (await writeClipboardText(inspectedNode.outer_html)) inspectNotice('success', 'outerHTML copied.');
+    else inspectNotice('warning', 'Clipboard blocked by the browser here.');
 });
 document.getElementById('btnInspectClear').addEventListener('click', async () => {
     await clearHighlight();
@@ -1997,27 +2011,58 @@ function showControlNotice(message, tone = '') {
 // navigator.clipboard needs a secure context, which a dashboard served over
 // plain HTTP on a LAN address never has. execCommand still works there, and is
 // the reason this is not a one-liner.
+//
+// The second reason is nastier. The old-style copy needs a focused, selected
+// textarea, and Bootstrap keeps a focus trap on every open modal: it listens
+// for focusin on the document and, for any target outside the modal element,
+// drags focus straight back inside. A textarea appended to <body> therefore
+// lost focus before execCommand ran - and execCommand still returned true, so
+// every copy button in the control view reported success while the clipboard
+// never changed. Measured: after pressing "copy as curl" the focus sat on
+// #btnLiveToggle and the system clipboard still held its previous contents.
+//
+// So the holder goes inside the open modal, where the trap leaves it alone,
+// and the result is only believed if the holder really did keep focus and the
+// selection.
 async function writeClipboardText(text) {
+    const payload = String(text ?? '');
+
     try {
         if (navigator.clipboard && window.isSecureContext) {
-            await navigator.clipboard.writeText(text);
+            await navigator.clipboard.writeText(payload);
             return true;
         }
     } catch (error) { /* fall through to the old way */ }
 
+    const modals = document.querySelectorAll('.modal.show');
+    const host = modals.length ? modals[modals.length - 1] : document.body;
+    const previous = document.activeElement;
+    const holder = document.createElement('textarea');
     try {
-        const holder = document.createElement('textarea');
-        holder.value = text;
+        holder.value = payload;
         holder.setAttribute('readonly', '');
-        holder.style.position = 'fixed';
-        holder.style.opacity = '0';
-        document.body.appendChild(holder);
+        holder.setAttribute('aria-hidden', 'true');
+        // Off-screen rather than hidden: display:none and visibility:hidden
+        // both make the selection unreachable, which defeats the whole thing.
+        holder.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0;pointer-events:none;';
+        host.appendChild(holder);
+        holder.focus({ preventScroll: true });
         holder.select();
-        const ok = document.execCommand('copy');
-        holder.remove();
-        return ok;
+        holder.setSelectionRange(0, payload.length);
+
+        const kept = document.activeElement === holder
+            && holder.selectionEnd - holder.selectionStart === payload.length;
+        const ok = kept && document.execCommand('copy');
+        return Boolean(ok);
     } catch (error) {
         return false;
+    } finally {
+        holder.remove();
+        // Removing the focused element drops focus to <body>; put it back so a
+        // copy does not quietly change where the next keystroke goes.
+        if (previous && previous.isConnected && typeof previous.focus === 'function') {
+            try { previous.focus({ preventScroll: true }); } catch (error) { /* not focusable any more */ }
+        }
     }
 }
 
@@ -2108,6 +2153,7 @@ btnPasteIntoPage.addEventListener('click', () => pasteIntoPage());
 document.addEventListener('paste', (e) => {
     if (!controlModalOpen || !currentTabId) return;
     if (!pasteBox.classList.contains('d-none')) return;   // the box takes its own
+    if (networkModalOpen) return;                         // so does the request popup
     const inControl = document.activeElement === screenWrapper || screenWrapper.classList.contains('has-focus');
     if (!inControl) return;
     const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
@@ -2139,9 +2185,9 @@ function resetNetworkBuffer() {
     networkDropped = 0;
     networkSelectedId = null;
     networkRenderSignature = '';
+    networkVisibleIds = [];
     networkRows.innerHTML = '';
-    networkDetailPane.classList.add('d-none');
-    networkDetailPane.innerHTML = '';
+    closeNetworkRequestModal();
     networkEmpty.classList.remove('d-none');
     networkEmpty.textContent = 'Recording. Click around in the page and the requests land here.';
     networkCount.textContent = 'no requests yet';
@@ -2161,6 +2207,7 @@ function closeNetworkPanel(options = {}) {
     const previousTab = networkTabId;
 
     networkOpen = false;
+    closeNetworkRequestModal();
     networkPanel.classList.add('d-none');
     networkPanel.classList.remove('d-flex');
     btnNetworkToggle.classList.remove('active');
@@ -2304,6 +2351,12 @@ function renderNetworkRows() {
     const all = [...networkEntries.values()];
     const rows = all.filter(networkMatches);
 
+    // Recorded before the early return below: prev/next walks the list the
+    // operator is looking at, so it has to stay in step with the filters even
+    // on a poll that changes nothing else.
+    networkVisibleIds = rows.map((entry) => entry.id);
+    if (networkModalOpen) updateNetworkModalNav();
+
     const signature = `${rows.map((e) => `${e.id}:${e.seq}`).join(',')}|${networkSelectedId}`;
     if (signature === networkRenderSignature) return;
     networkRenderSignature = signature;
@@ -2341,13 +2394,116 @@ function renderNetworkRows() {
 networkRows.addEventListener('click', (e) => {
     const row = e.target.closest('[data-net-id]');
     if (!row) return;
-    showNetworkDetail(row.getAttribute('data-net-id'));
+    openNetworkRequestModal(row.getAttribute('data-net-id'));
 });
 
 [networkFilter, networkTypeFilter, networkFailedOnly].forEach((el) => {
     el.addEventListener('input', () => { networkRenderSignature = ''; renderNetworkRows(); });
     el.addEventListener('change', () => { networkRenderSignature = ''; renderNetworkRows(); });
 });
+
+// --- The request popup ----------------------------------------------------
+// One request is a document, not a row: headers, payload and body all want
+// width. It opens over the control view, walks the list with the arrows, and
+// closes with the button, the backdrop or Escape.
+
+function openNetworkRequestModal(id) {
+    if (!id) return;
+    networkSelectedId = id;
+    networkRenderSignature = '';
+    renderNetworkRows();
+
+    if (!networkModalOpen) {
+        networkModalOpener = document.activeElement;
+        networkModalOpen = true;
+        networkRequestModal.classList.remove('d-none');
+        // Focus moves into the sheet so the keystrokes the operator types next
+        // steer the popup instead of being forwarded into the remote page.
+        netModalDialog.focus({ preventScroll: true });
+    }
+    hideNetModalFallback();
+    netModalBody.innerHTML = '<div class="text-theme-muted small">Loading…</div>';
+    updateNetworkModalNav();
+    loadNetworkRequest(id);
+}
+
+async function loadNetworkRequest(id) {
+    const token = ++networkModalToken;
+    const instance = networkInstanceId;
+    const tab = networkTabId;
+    const summary = networkEntries.get(id);
+
+    // Header first, from what the list already knows: the sheet should never
+    // sit there blank while the full request is on its way.
+    netModalMethod.innerText = summary ? summary.method : '—';
+    netModalUrl.innerText = summary ? summary.url : id;
+    netModalUrl.title = summary ? summary.url : '';
+    netModalMeta.innerText = '';
+    networkModalRequest = null;
+
+    if (!instance || !tab) {
+        netModalBody.innerHTML = '<div class="text-danger small">This tab is no longer being recorded.</div>';
+        return;
+    }
+
+    try {
+        const res = await fetchJsonOrThrow(
+            `/api/instances/${instance}/tabs/${tab}/network/${encodeURIComponent(id)}`);
+        if (token !== networkModalToken || !networkModalOpen) return;
+        networkModalRequest = res.request;
+        renderNetworkDetail(res.request);
+    } catch (error) {
+        if (token !== networkModalToken || !networkModalOpen) return;
+        netModalBody.innerHTML = `<div class="text-danger small">${escapeHtml(error.message || 'Could not load the request')}</div>`;
+    }
+}
+
+function closeNetworkRequestModal() {
+    if (!networkModalOpen) {
+        networkRequestModal.classList.add('d-none');
+        return;
+    }
+    networkModalOpen = false;
+    networkModalRequest = null;
+    networkModalToken++;
+    networkRequestModal.classList.add('d-none');
+    hideNetModalFallback();
+    netModalBody.innerHTML = '';
+
+    const opener = networkModalOpener;
+    networkModalOpener = null;
+    if (opener && opener.isConnected && typeof opener.focus === 'function') {
+        try { opener.focus({ preventScroll: true }); } catch (error) { /* gone */ }
+    }
+}
+
+// Walks the filtered list, not the whole log: what the arrows do has to match
+// what the operator can see behind the sheet.
+function stepNetworkRequest(delta) {
+    if (!networkVisibleIds.length) return;
+    const at = networkVisibleIds.indexOf(networkSelectedId);
+    const next = at === -1
+        ? (delta > 0 ? 0 : networkVisibleIds.length - 1)
+        : at + delta;
+    if (next < 0 || next >= networkVisibleIds.length) return;
+    openNetworkRequestModal(networkVisibleIds[next]);
+}
+
+function updateNetworkModalNav() {
+    const at = networkVisibleIds.indexOf(networkSelectedId);
+    const total = networkVisibleIds.length;
+    if (at === -1) {
+        // The request on screen is not in the list any more, because the
+        // filters changed under it. The arrows then jump back into the list
+        // rather than going dead.
+        btnNetPrev.disabled = total === 0;
+        btnNetNext.disabled = total === 0;
+    } else {
+        btnNetPrev.disabled = at <= 0;
+        btnNetNext.disabled = at >= total - 1;
+    }
+    netModalPosition.innerText = at === -1 ? `— / ${total}` : `${at + 1} / ${total}`;
+}
 
 function headerRows(headers) {
     if (!headers || !Object.keys(headers).length) return '<span class="text-theme-muted">none recorded</span>';
@@ -2385,37 +2541,29 @@ function toCurl(request) {
     return parts.join(' \\\n  ');
 }
 
-async function showNetworkDetail(id) {
-    networkSelectedId = id;
-    networkRenderSignature = '';
-    renderNetworkRows();
-    networkDetailPane.classList.remove('d-none');
-    networkDetailPane.innerHTML = '<div class="p-3 text-theme-muted small">Loading...</div>';
-
-    try {
-        const res = await fetchJsonOrThrow(
-            `/api/instances/${networkInstanceId}/tabs/${networkTabId}/network/${encodeURIComponent(id)}`);
-        if (networkSelectedId !== id) return;
-        renderNetworkDetail(res.request);
-    } catch (error) {
-        networkDetailPane.innerHTML = `<div class="p-3 text-danger small">${escapeHtml(error.message || 'Could not load the request')}</div>`;
-    }
-}
-
+// Two columns, split the way the exchange itself is: everything that went out
+// on the left, everything that came back on the right.
 function renderNetworkDetail(request) {
     const started = request.started_at ? new Date(request.started_at).toLocaleTimeString() : '-';
-    networkDetailPane.innerHTML = `
-        <div class="p-2 border-bottom border-theme d-flex gap-2 align-items-center bg-theme-surface position-sticky top-0">
-            <span class="badge bg-secondary">${escapeHtml(request.method)}</span>
-            <span class="small text-truncate flex-grow-1" title="${escapeAttr(request.url)}">${escapeHtml(request.url)}</span>
-            <button class="btn btn-sm btn-outline-secondary" id="btnNetCopyCurl" title="Copy as a curl command"><i class="bi bi-terminal"></i></button>
-            <button class="btn btn-sm btn-outline-secondary" id="btnNetCopyBody" title="Copy the response body"><i class="bi bi-clipboard"></i></button>
-            <button class="btn btn-sm btn-outline-secondary" id="btnNetCloseDetail" title="Close"><i class="bi bi-x-lg"></i></button>
-        </div>
-        <div class="p-2">
+    const status = request.failed
+        ? `failed: ${escapeHtml(request.error_text || '')}`
+        : `${request.status ?? '-'} ${escapeHtml(request.status_text || '')}`;
+
+    netModalMethod.innerText = request.method || '—';
+    netModalUrl.innerText = request.url || '';
+    netModalUrl.title = request.url || '';
+    netModalMeta.innerHTML = [
+        status,
+        escapeHtml(request.resource_type || ''),
+        request.from_cache ? 'from cache' : (request.size_bytes ? formatBytes(request.size_bytes) : ''),
+        request.duration_ms === null || request.duration_ms === undefined ? '' : `${request.duration_ms} ms`,
+    ].filter(Boolean).join(' · ');
+
+    netModalBody.innerHTML = `
+        <div class="net-col">
             <h6>General</h6>
             <div class="net-kv mb-3">
-                <span>Status</span><span>${request.failed ? `failed: ${escapeHtml(request.error_text || '')}` : `${request.status ?? '-'} ${escapeHtml(request.status_text || '')}`}</span>
+                <span>Status</span><span>${status}</span>
                 <span>Type</span><span>${escapeHtml(request.resource_type || '-')}${request.mime_type ? ` (${escapeHtml(request.mime_type)})` : ''}</span>
                 <span>Remote</span><span>${escapeHtml(request.remote_address || '-')} ${escapeHtml(request.protocol || '')}</span>
                 <span>Size</span><span>${request.from_cache ? 'from cache' : (request.size_bytes ? formatBytes(request.size_bytes) : '-')}</span>
@@ -2428,32 +2576,124 @@ function renderNetworkDetail(request) {
             <h6>Request headers</h6>
             <div class="mb-3">${headerRows(request.request_headers)}</div>
 
-            ${request.post_data ? `<h6>Payload</h6><div class="mb-3"><pre>${escapeHtml(request.post_data)}</pre>${request.post_data_truncated ? '<div class="text-theme-muted x-small mt-1">Truncated.</div>' : ''}</div>` : ''}
-
+            ${request.post_data ? `${netSection('Payload', 'payload', true)}<div class="mb-3"><pre>${escapeHtml(request.post_data)}</pre>${request.post_data_truncated ? '<div class="text-theme-muted x-small mt-1">Truncated.</div>' : ''}</div>` : ''}
+        </div>
+        <div class="net-col">
             <h6>Response headers</h6>
             <div class="mb-3">${headerRows(request.response_headers)}</div>
 
-            <h6>Response body</h6>
+            ${netSection('Response body', 'body', Boolean(request.body_available))}
             <div>${prettyBody(request)}</div>
         </div>`;
-
-    document.getElementById('btnNetCloseDetail').addEventListener('click', () => {
-        networkDetailPane.classList.add('d-none');
-        networkSelectedId = null;
-        networkRenderSignature = '';
-        renderNetworkRows();
-    });
-    document.getElementById('btnNetCopyCurl').addEventListener('click', async () => {
-        const ok = await writeClipboardText(toCurl(request));
-        showControlNotice(ok ? 'curl command copied' : 'The browser blocked the clipboard here', ok ? 'good' : 'bad');
-    });
-    document.getElementById('btnNetCopyBody').addEventListener('click', async () => {
-        if (!request.body_available) { showControlNotice('This request has no body to copy', 'bad'); return; }
-        const ok = await writeClipboardText(request.body || '');
-        showControlNotice(ok ? 'Response body copied' : 'The browser blocked the clipboard here', ok ? 'good' : 'bad');
-    });
 }
 
+// What each copy button hands over, decided in one place so the button in the
+// header and the one beside the section can never disagree.
+//
+// Bodies are copied raw, exactly as they came off the wire, even where the
+// sheet pretty-prints the JSON above them: a copy that reformats what it
+// copies is no longer the response, and anything hashed or diffed against the
+// server's own output would not match.
+function networkCopySource(request, what) {
+    if (what === 'curl') return { text: toCurl(request), label: 'curl command' };
+    if (what === 'payload') {
+        if (!request.post_data) return { error: 'This request was sent without a payload' };
+        return { text: request.post_data, label: 'payload', truncated: Boolean(request.post_data_truncated) };
+    }
+    if (!request.body_available) return { error: request.body_error || 'No body was kept for this request' };
+    return { text: request.body || '', label: 'response body', truncated: Boolean(request.body_truncated) };
+}
+
+// Copying is attempted for real and only reported as done if it happened; when
+// the browser refuses, the text is handed over to be copied by hand instead.
+async function copyFromNetworkModal(what) {
+    const request = networkModalRequest;
+    if (!request) { showControlNotice('The request is still loading', 'bad'); return; }
+
+    const source = networkCopySource(request, what);
+    if (source.error) { showControlNotice(source.error, 'bad'); return; }
+
+    // Said out loud rather than quietly: what reached the clipboard is only as
+    // much of the body as the recorder kept.
+    const caveat = source.truncated ? ' (only the part that was kept)' : '';
+
+    const ok = await writeClipboardText(source.text);
+    if (ok) {
+        hideNetModalFallback();
+        showControlNotice(`Copied the ${source.label}${caveat}`, 'good');
+        return;
+    }
+    showNetModalFallback(source.text, source.label);
+    showControlNotice('Your browser blocked the clipboard, so the text is shown instead', 'bad');
+}
+
+// A section heading with its own copy button, for the parts worth taking out
+// of the sheet whole.
+function netSection(title, what, available) {
+    if (!available) return `<h6>${escapeHtml(title)}</h6>`;
+    return `<h6 class="net-section"><span>${escapeHtml(title)}</span>
+        <button type="button" class="net-copy-btn" data-net-copy="${escapeAttr(what)}" title="Copy the ${escapeAttr(title.toLowerCase())}">
+            <i class="bi bi-clipboard"></i> Copy
+        </button></h6>`;
+}
+
+function showNetModalFallback(text, label) {
+    netModalFallbackLabel.innerText = `Your browser blocked the clipboard — select the ${label} below and press Cmd/Ctrl+C`;
+    netModalFallback.classList.remove('d-none');
+    netModalFallbackText.value = text;
+    netModalFallbackText.focus({ preventScroll: true });
+    netModalFallbackText.select();
+}
+
+function hideNetModalFallback() {
+    netModalFallback.classList.add('d-none');
+    netModalFallbackText.value = '';
+}
+
+btnNetPrev.addEventListener('click', () => stepNetworkRequest(-1));
+btnNetNext.addEventListener('click', () => stepNetworkRequest(1));
+document.getElementById('btnNetModalClose').addEventListener('click', () => closeNetworkRequestModal());
+document.getElementById('btnNetFallbackHide').addEventListener('click', () => {
+    hideNetModalFallback();
+    netModalDialog.focus({ preventScroll: true });
+});
+document.getElementById('btnNetCopyCurl').addEventListener('click', () => copyFromNetworkModal('curl'));
+document.getElementById('btnNetCopyBody').addEventListener('click', () => copyFromNetworkModal('body'));
+// Delegated: the section buttons are rewritten with the sheet on every request.
+netModalBody.addEventListener('click', (e) => {
+    const button = e.target.closest('[data-net-copy]');
+    if (!button) return;
+    copyFromNetworkModal(button.getAttribute('data-net-copy'));
+});
+networkRequestModal.addEventListener('click', (e) => {
+    if (e.target.hasAttribute('data-net-dismiss')) closeNetworkRequestModal();
+});
+
+// Capture phase, and the event stops here: Bootstrap dismisses a modal on
+// Escape from a listener on the modal element, and this popup lives inside it,
+// so a bubbling Escape would close the whole control view behind it.
+document.addEventListener('keydown', (e) => {
+    if (!networkModalOpen) return;
+    const typing = e.target && e.target.closest && e.target.closest('input, textarea, select');
+
+    if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!netModalFallback.classList.contains('d-none')) {
+            hideNetModalFallback();
+            netModalDialog.focus({ preventScroll: true });
+            return;
+        }
+        closeNetworkRequestModal();
+        return;
+    }
+    if (typing) return;
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault();
+        e.stopPropagation();
+        stepNetworkRequest(e.key === 'ArrowRight' ? 1 : -1);
+    }
+}, true);
 btnNetworkToggle.addEventListener('click', () => {
     if (networkOpen) closeNetworkPanel();
     else openNetworkPanel();
@@ -2647,12 +2887,11 @@ if (btnRestReveal) {
 if (btnRestCopy) {
     btnRestCopy.addEventListener('click', async () => {
         if (!restApiKeyInput.value) return;
-        try {
-            await navigator.clipboard.writeText(restApiKeyInput.value);
+        if (await writeClipboardText(restApiKeyInput.value)) {
             showRestAlert('success', 'API key copied to clipboard.');
-        } catch {
-            // Clipboard access needs a secure context; over plain HTTP on a LAN
-            // address it is unavailable, so fall back to selecting the text.
+        } else {
+            // Nothing left to try: show the key and select it so it can be
+            // copied by hand.
             restApiKeyInput.type = 'text';
             restApiKeyInput.select();
             showRestAlert('warning', 'Clipboard blocked by the browser — the key is selected, copy it manually.');

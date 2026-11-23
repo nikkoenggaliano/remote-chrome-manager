@@ -424,15 +424,87 @@ body {
 .network-name .net-path { overflow: hidden; text-overflow: ellipsis; }
 .network-name .net-host { color: var(--text-muted); font-size: 0.68rem; flex: 0 0 auto; }
 
-.network-detail {
-    width: 46%;
-    min-width: 260px;
-    border-left: 1px solid var(--border-color);
-    background: var(--bg-card);
-    font-size: 0.76rem;
+/* --- Request detail popup ------------------------------------------------ */
+/* The log is a list; a single request is a document. It gets its own sheet over
+   the control view, with the headers and the body side by side, because a 46%
+   column beside the list could show neither without wrapping every line. */
+.net-modal {
+    /* Fixed, not absolute: the modal it lives in is its own scroll container,
+       and a sheet that scrolls away with the page behind it is not a dialog. */
+    position: fixed;
+    inset: 0;
+    z-index: 1300;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
 }
 
-.network-detail h6 {
+.net-modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+}
+
+.net-modal-dialog {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: min(1100px, 100%);
+    max-height: 100%;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: var(--modal-bg);
+    color: var(--text-main);
+    box-shadow: var(--shadow-md);
+    outline: none;
+    overflow: hidden;
+}
+
+.net-modal-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-card);
+}
+
+/* The URL is the one part allowed to be squeezed, and it can only ellipsize if
+   it is allowed to be narrower than its text. */
+.net-modal-head-main {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.net-modal-url {
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+
+.net-modal-body {
+    flex: 1 1 auto;
+    overflow: auto;
+    padding: 12px 14px;
+    font-size: 0.78rem;
+    display: grid;
+    gap: 0 18px;
+    grid-template-columns: minmax(280px, 38%) 1fr;
+    align-content: start;
+}
+
+/* One column once the sheet is too narrow to keep the body legible beside the
+   headers. */
+@media (max-width: 920px) {
+    .net-modal-body { grid-template-columns: 1fr; }
+}
+
+.net-modal-body > .net-col {
+    min-width: 0;
+}
+
+.net-modal-body h6 {
     font-size: 0.68rem;
     text-transform: uppercase;
     letter-spacing: 0.03em;
@@ -441,26 +513,58 @@ body {
     margin: 0 0 4px;
 }
 
-.network-detail .net-kv {
+/* A heading that carries its own copy button for the block under it. */
+.net-modal-body h6.net-section {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.net-copy-btn {
+    border: 1px solid var(--border-color);
+    background: transparent;
+    color: var(--text-muted);
+    border-radius: 4px;
+    padding: 0 6px;
+    font-size: 0.64rem;
+    line-height: 1.7;
+    letter-spacing: 0.03em;
+    cursor: pointer;
+}
+
+.net-copy-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-main);
+    border-color: var(--text-muted);
+}
+
+.net-modal-body .net-kv {
     display: grid;
-    grid-template-columns: minmax(90px, 32%) 1fr;
+    grid-template-columns: minmax(90px, 34%) 1fr;
     gap: 2px 8px;
     word-break: break-all;
 }
 
-.network-detail .net-kv > span:nth-child(odd) { color: var(--text-muted); }
+.net-modal-body .net-kv > span:nth-child(odd) { color: var(--text-muted); }
 
-.network-detail pre {
+.net-modal-body pre {
     background: var(--terminal-bg);
     color: var(--terminal-text);
     border-radius: 4px;
     padding: 8px;
     margin: 0;
-    max-height: 220px;
+    max-height: 340px;
     overflow: auto;
     font-size: 0.72rem;
     white-space: pre-wrap;
     word-break: break-all;
+}
+
+.net-modal-foot {
+    flex: 0 0 auto;
+    padding: 8px 10px;
+    border-top: 1px solid var(--border-color);
+    background: var(--bg-card);
 }
 
 /* --- Clipboard helper ---------------------------------------------------- */
@@ -481,7 +585,7 @@ body {
 
 .control-notice {
     position: absolute;
-    z-index: 1250;
+    z-index: 1400;
     bottom: 14px;
     left: 50%;
     transform: translateX(-50%);
