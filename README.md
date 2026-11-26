@@ -29,6 +29,19 @@ Chrome Fleet Control is a dashboard for managing multiple Chrome or Chromium ins
   with next/previous buttons (or the arrow keys) to walk the list, a copy button on the
   payload and on the response body (plus copy-as-curl in the header), and Escape or the
   X to close
+- **Console panel** per tab, like a browser's own: what the page logs with its objects
+  described rather than printed as `[object Object]`, uncaught exceptions with their stacks,
+  and the warnings the browser itself raises (CSP, blocked content, deprecations) which never
+  go through `console` at all. Filter by level or by text, copy a line with its stack or the
+  whole transcript, and **type at the prompt** to run an expression in the page — with the
+  DevTools command line API (`$`, `$$`, `$0`, `copy`), `let` re-declarable as in a real
+  console, promises awaited, and history on the up arrow. Attaching replays what Chrome had
+  already buffered, so the panel opens with the page's history rather than with nothing
+- **Storage panel** per tab, the browser's Application panel over the wire: `localStorage`,
+  `sessionStorage` and cookies for the origin the tab is on, read from the browser side so
+  the page cannot hide anything and `httpOnly` cookie values are visible. Click a row to open
+  the value in an editor with room to read it, re-indent JSON before saving, add or delete an
+  item, or empty an area behind a confirmation that names what it is about to remove
 - **Copy and paste across the wire**: Ctrl+C takes the page's selection to your clipboard
   and Ctrl+V types yours into the page, with a fallback box for the plain-HTTP LAN case
   where browsers refuse clipboard access
@@ -277,6 +290,8 @@ What it covers:
 | Page content | `html` (loaded DOM, `format=json\|html\|text`), `evaluate`, `screenshot`, `pdf`, `inspect` |
 | Device | `emulation` — read or set viewport, user agent, Client Hints and touch per tab |
 | Network | `network/start`, `network` (poll with `since_seq`), `network/:requestId` (headers + body), `network/stop` |
+| Console | `console/start`, `console` (poll with `since_seq`), `console/eval` (run an expression and keep it in the transcript), `console/stop` |
+| Storage | `storage` (localStorage, sessionStorage and cookies in one read), `POST storage` (write one item or cookie), `DELETE storage/:area` (`?key=` one, or `?clear=1` the area) |
 | Clipboard | `selection` (what the page has selected) and `paste` (into the focused element) |
 | Whole instance | `tabs/html` and `tabs/screenshot` capture every tab in one call |
 | Input | `input` — mouse, key, and text events |
@@ -296,3 +311,13 @@ Two things worth knowing before you script against it:
 - **Closing the last tab never stops an instance.** The API opens a replacement
   blank tab first and returns it as `replacement`, because in `gui`/`xvfb` mode
   closing the final tab would terminate the browser.
+- **`GET /instances/:id/tabs/:tabId/storage` reads the stores from the browser side**,
+  not by running script in the page, so a page that has replaced its own `localStorage`
+  cannot hide anything and `httpOnly` cookie values come back in full. Each area says
+  which way it was read. A tab on `about:blank` or a `data:` URL has an opaque origin and
+  therefore no storage at all: that answers `has_storage: false` rather than with empty
+  stores that look real.
+- **`POST /instances/:id/tabs/:tabId/console/eval` runs in the page's main world** with the
+  DevTools command line API available, and both the expression and its answer are appended
+  to that tab's transcript. Use `POST /tabs/:tabId/evaluate` instead when you want one value
+  and no transcript.

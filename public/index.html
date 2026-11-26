@@ -643,7 +643,7 @@
 <div class="col-md-9 d-flex flex-column h-100 bg-black">
     <div id="tabContent" class="d-none h-100 flex-column position-relative">
         <!-- Address Bar -->
-        <div class="p-2 border-bottom border-theme bg-theme-surface d-flex gap-2 align-items-center">
+        <div class="p-2 border-bottom border-theme bg-theme-surface d-flex gap-2 align-items-center flex-wrap">
             <div class="btn-group btn-group-sm">
                 <button class="btn btn-outline-secondary" id="btnTabBack" title="Back"><i class="bi bi-arrow-left"></i></button>
                 <button class="btn btn-outline-secondary" id="btnTabForward" title="Forward"><i class="bi bi-arrow-right"></i></button>
@@ -651,12 +651,22 @@
             </div>
             <input type="text" id="activeTabUrl" class="form-control form-control-sm form-control-theme font-monospace shadow-none">
             <button class="btn btn-sm btn-primary" id="btnGo">Go</button>
-            <button class="btn btn-sm btn-outline-info text-nowrap" id="btnInspectHtml" title="Inspect the HTML the browser has actually loaded">
-                <i class="bi bi-code-slash"></i> HTML
-            </button>
-            <button class="btn btn-sm btn-outline-warning text-nowrap" id="btnNetworkToggle" title="Record this tab's requests and responses">
-                <i class="bi bi-activity"></i> Network
-            </button>
+            <!-- The panels that open underneath the live view, grouped because only
+                 one of them can have the drawer at a time. -->
+            <div class="btn-group btn-group-sm flex-shrink-0" role="group" aria-label="Inspect">
+                <button class="btn btn-outline-info text-nowrap" id="btnInspectHtml" title="Inspect the HTML the browser has actually loaded">
+                    <i class="bi bi-code-slash"></i> HTML
+                </button>
+                <button class="btn btn-outline-warning text-nowrap" id="btnNetworkToggle" title="Record this tab's requests and responses">
+                    <i class="bi bi-activity"></i> Network
+                </button>
+                <button class="btn btn-outline-success text-nowrap" id="btnConsoleToggle" title="What the page logs, and a prompt to run expressions in it">
+                    <i class="bi bi-terminal"></i> Console
+                </button>
+                <button class="btn btn-outline-primary text-nowrap" id="btnStorageToggle" title="localStorage, sessionStorage and cookies for this tab">
+                    <i class="bi bi-database"></i> Storage
+                </button>
+            </div>
             <button class="btn btn-sm btn-outline-secondary" id="btnCopySelection" title="Copy the page's selected text to your clipboard">
                 <i class="bi bi-clipboard-check"></i>
             </button>
@@ -698,7 +708,7 @@
                                 <div id="controlNotice" class="control-notice d-none"></div>
 
                                 <!-- Network panel -->
-                                <div id="networkPanel" class="network-panel d-none flex-column">
+                                <div id="networkPanel" class="control-drawer d-none flex-column">
                                     <div class="d-flex align-items-center gap-2 px-2 py-1 bg-theme-surface border-top border-bottom border-theme flex-wrap">
                                         <span class="d-flex align-items-center gap-1 small fw-bold text-uppercase text-theme-muted">
                                             <span id="networkStatusDot" class="status-indicator status-stopped"></span> Network
@@ -743,6 +753,86 @@
                                         </div>
                                     </div>
                                 </div>
+                                <!-- Console drawer ----------------------------------------
+                                     Two halves of one thing: what the page says, and a place
+                                     to say something back. The prompt is a textarea rather
+                                     than an input so a multi-line expression can be typed and
+                                     read before it is run. -->
+                                <div id="consolePanel" class="control-drawer d-none flex-column">
+                                    <div class="d-flex align-items-center gap-2 px-2 py-1 bg-theme-surface border-top border-bottom border-theme flex-wrap">
+                                        <span class="d-flex align-items-center gap-1 small fw-bold text-uppercase text-theme-muted">
+                                            <span id="consoleStatusDot" class="status-indicator status-stopped"></span> Console
+                                        </span>
+                                        <input type="text" id="consoleFilter" class="form-control form-control-sm form-control-theme"
+                                               placeholder="Filter text" style="max-width: 150px;" autocomplete="off">
+                                        <select id="consoleLevelFilter" class="form-select form-select-sm form-select-theme" style="max-width: 128px;">
+                                            <option value="">All levels</option>
+                                            <option value="error">Errors</option>
+                                            <option value="warn">Warnings</option>
+                                            <option value="log">Logs</option>
+                                            <option value="info">Info</option>
+                                            <option value="debug">Debug</option>
+                                        </select>
+                                        <span class="x-small text-theme-muted ms-auto text-nowrap" id="consoleCount">nothing logged yet</span>
+                                        <button class="btn btn-sm btn-outline-secondary" id="btnConsoleReload" title="Reload the page, so what it logs while loading is recorded too"><i class="bi bi-arrow-clockwise"></i></button>
+                                        <button class="btn btn-sm btn-outline-secondary" id="btnConsoleCopy" title="Copy the whole transcript"><i class="bi bi-clipboard"></i></button>
+                                        <button class="btn btn-sm btn-outline-secondary" id="btnConsoleClear" title="Clear the transcript"><i class="bi bi-trash"></i></button>
+                                        <button class="btn btn-sm btn-outline-secondary" id="btnConsolePanelClose" title="Stop recording and close"><i class="bi bi-x-lg"></i></button>
+                                    </div>
+                                    <div class="console-log flex-grow-1 overflow-auto" id="consoleLog">
+                                        <div id="consoleEmpty" class="p-3 text-center text-theme-muted small">
+                                            Recording. Anything the page logs from now on lands here.
+                                        </div>
+                                    </div>
+                                    <div class="console-prompt d-flex align-items-start gap-1 px-2 py-1 border-top border-theme bg-theme-surface">
+                                        <i class="bi bi-chevron-right text-primary mt-1"></i>
+                                        <textarea id="consoleInput" rows="1" spellcheck="false" autocomplete="off"
+                                                  class="form-control form-control-sm form-control-theme font-monospace border-0 shadow-none"
+                                                  placeholder="Run an expression in the page — Enter runs it, Shift+Enter adds a line, ↑ walks the history"></textarea>
+                                        <button class="btn btn-sm btn-primary flex-shrink-0" id="btnConsoleRun" title="Run (Enter)"><i class="bi bi-play-fill"></i></button>
+                                    </div>
+                                </div>
+
+                                <!-- Storage drawer ----------------------------------------
+                                     localStorage, sessionStorage and cookies for whatever
+                                     origin the tab is on. Reading is one call; a click on a
+                                     row opens the value in a sheet, because a token or a blob
+                                     of JSON is not something a table cell can show. -->
+                                <div id="storagePanel" class="control-drawer d-none flex-column">
+                                    <div class="d-flex align-items-center gap-2 px-2 py-1 bg-theme-surface border-top border-bottom border-theme flex-wrap">
+                                        <span class="d-flex align-items-center gap-1 small fw-bold text-uppercase text-theme-muted">
+                                            <span id="storageStatusDot" class="status-indicator status-stopped"></span> Storage
+                                        </span>
+                                        <div class="btn-group btn-group-sm" role="group" aria-label="Storage area">
+                                            <button type="button" class="btn btn-outline-secondary active" data-storage-area="local">
+                                                Local <span class="badge bg-secondary ms-1" id="storageCountLocal">0</span>
+                                            </button>
+                                            <button type="button" class="btn btn-outline-secondary" data-storage-area="session">
+                                                Session <span class="badge bg-secondary ms-1" id="storageCountSession">0</span>
+                                            </button>
+                                            <button type="button" class="btn btn-outline-secondary" data-storage-area="cookies">
+                                                Cookies <span class="badge bg-secondary ms-1" id="storageCountCookies">0</span>
+                                            </button>
+                                        </div>
+                                        <input type="text" id="storageFilter" class="form-control form-control-sm form-control-theme"
+                                               placeholder="Filter" style="max-width: 140px;" autocomplete="off">
+                                        <span class="x-small text-theme-muted font-monospace text-truncate" id="storageOrigin"></span>
+                                        <span class="d-flex gap-2 flex-shrink-0">
+                                            <button class="btn btn-sm btn-outline-success" id="btnStorageAdd" title="Add an item"><i class="bi bi-plus-lg"></i> Add</button>
+                                            <button class="btn btn-sm btn-outline-secondary" id="btnStorageRefresh" title="Read it again"><i class="bi bi-arrow-clockwise"></i></button>
+                                            <button class="btn btn-sm btn-outline-danger" id="btnStorageClear" title="Empty this area"><i class="bi bi-trash"></i></button>
+                                            <button class="btn btn-sm btn-outline-secondary" id="btnStoragePanelClose" title="Close"><i class="bi bi-x-lg"></i></button>
+                                        </span>
+                                    </div>
+                                    <div class="storage-list flex-grow-1 overflow-auto">
+                                        <table class="table table-sm table-theme storage-table mb-0">
+                                            <thead><tr id="storageHead"></tr></thead>
+                                            <tbody id="storageRows"></tbody>
+                                        </table>
+                                        <div id="storageEmpty" class="p-3 text-center text-theme-muted small">Reading…</div>
+                                    </div>
+                                </div>
+
                                 <!-- Status bar -->
                                 <div class="px-2 py-1 border-top border-theme bg-theme-surface d-flex justify-content-between align-items-center" style="font-size: 0.72rem;">
                                     <span class="text-theme-muted d-flex align-items-center gap-2">
@@ -759,6 +849,43 @@
                             </div>
                         </div>
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Storage item editor -------------------------------------------------
+             A child of #controlModal for the same reason as the request popup:
+             Bootstrap's focus trap would otherwise pull focus out of these fields
+             the instant they ask for it, which breaks both typing and copying. -->
+        <div id="storageItemModal" class="net-modal d-none">
+            <div class="net-modal-backdrop" data-storage-dismiss="1"></div>
+            <div class="net-modal-dialog storage-item-dialog" role="dialog" aria-modal="true" aria-labelledby="storageItemTitle" tabindex="-1">
+                <div class="net-modal-header">
+                    <span class="badge bg-secondary flex-shrink-0" id="storageItemArea">local</span>
+                    <div class="net-modal-head-main">
+                        <div class="net-modal-url font-monospace text-truncate" id="storageItemTitle">New item</div>
+                        <div class="x-small text-theme-muted text-truncate" id="storageItemMeta"></div>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-outline-secondary flex-shrink-0" id="btnStorageItemCopy" title="Copy the value"><i class="bi bi-clipboard"></i></button>
+                    <button type="button" class="btn btn-sm btn-outline-danger flex-shrink-0" id="btnStorageItemClose" title="Close (Esc)" aria-label="Close"><i class="bi bi-x-lg"></i></button>
+                </div>
+                <div class="net-modal-body storage-item-body">
+                    <label class="x-small fw-bold text-uppercase text-theme-muted" for="storageItemKey">Key</label>
+                    <input id="storageItemKey" class="form-control form-control-sm form-control-theme font-monospace mt-1 mb-3" spellcheck="false" autocomplete="off">
+                    <div class="d-flex align-items-center gap-2">
+                        <label class="x-small fw-bold text-uppercase text-theme-muted flex-grow-1 m-0" for="storageItemValue">Value</label>
+                        <button type="button" class="net-copy-btn" id="btnStorageItemPretty" title="Re-indent the value as JSON before saving it">Format JSON</button>
+                    </div>
+                    <textarea id="storageItemValue" rows="11" spellcheck="false"
+                              class="form-control form-control-sm form-control-theme font-monospace mt-1"></textarea>
+                    <div class="x-small text-theme-muted mt-1" id="storageItemHint"></div>
+                </div>
+                <div class="net-modal-foot d-flex justify-content-between align-items-center gap-2">
+                    <button type="button" class="btn btn-sm btn-outline-danger" id="btnStorageItemDelete"><i class="bi bi-trash"></i> Delete</button>
+                    <span class="d-flex gap-2">
+                        <button type="button" class="btn btn-sm btn-theme-secondary" id="btnStorageItemCancel">Cancel</button>
+                        <button type="button" class="btn btn-sm btn-primary" id="btnStorageItemSave">Save</button>
+                    </span>
                 </div>
             </div>
         </div>

@@ -22,6 +22,7 @@ const cdpClient = require('./lib/cdp-client');
 const { parseCookieFiles } = require('./lib/cookie-import');
 const { parseSessionFiles, parseCookieMirrors } = require('./lib/session-import');
 const networkRecorder = require('./lib/network-recorder');
+const consoleRecorder = require('./lib/console-recorder');
 const devicePresets = require('./lib/device-presets');
 const { parseChromeFlags, readStoredFlags, serializeFlags } = require('./lib/chrome-flags');
 const { runChecks } = require('./lib/dep-check');
@@ -933,6 +934,7 @@ function releaseInstanceTabState(instance) {
   // keep about them: a recorder would hold a socket to a dead port, and a
   // stale emulation entry would be re-applied to whatever tab inherited the id.
   networkRecorder.stopForEndpoint(instance.host, instance.port);
+  consoleRecorder.stopForEndpoint(instance.host, instance.port);
   cdpClient.clearEmulationForEndpoint(instance.host, instance.port);
 }
 
@@ -1321,6 +1323,145 @@ async function handleNetworkRequest(req, res) {
   }
 }
 
+// --- Console -------------------------------------------------------------
+
+async function handleConsoleStart(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const status = await consoleRecorder.start(instance.host, instance.port, req.params.tabId);
+  res.json({ success: true, ...status });
+}
+
+async function handleConsoleStop(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const stopped = consoleRecorder.stop(instance.host, instance.port, req.params.tabId);
+  res.json({ success: true, stopped });
+}
+
+async function handleConsoleList(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const sinceSeq = parseIntInRange(req.query?.since_seq, 'since_seq', { min: 0, max: Number.MAX_SAFE_INTEGER, fallback: 0 });
+  const limit = parseIntInRange(req.query?.limit, 'limit', { min: 1, max: 2000, fallback: undefined });
+  const status = await consoleRecorder.list(instance.host, instance.port, req.params.tabId, { sinceSeq, limit });
+  res.json({ instance_id: instance.id, tab_id: req.params.tabId, ...status });
+}
+
+async function handleConsoleClear(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const cleared = consoleRecorder.clear(instance.host, instance.port, req.params.tabId);
+  res.json({ success: true, cleared });
+}
+
+async function handleConsoleEval(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const expression = typeof req.body?.expression === 'string' ? req.body.expression : '';
+  if (!expression.trim()) {
+    throw createHttpError(400, 'Send the expression to run as "expression"');
+  }
+
+  const result = await consoleRecorder.evaluate(instance.host, instance.port, req.params.tabId, expression);
+  // An expression that throws is an answer, not a server fault: it goes back as
+  // 200 with `ok: false` and the page's own message, because the transcript
+  // needs the failure in it just as much as a success.
+  res.json({ instance_id: instance.id, tab_id: req.params.tabId, ...result });
+}
+
+// --- Storage -------------------------------------------------------------
+
+function storageAreaFromParams(value, { allowCookies = true } = {}) {
+  const area = normalizeString(value).toLowerCase();
+  const known = allowCookies ? ['local', 'session', 'cookies'] : ['local', 'session'];
+  if (!known.includes(area)) {
+    throw createHttpError(400, `"area" must be one of ${known.join(', ')}`);
+  }
+  return area;
+}
+
+function rethrowStorageError(error) {
+  if (error.code === 'OPAQUE_ORIGIN') throw createHttpError(409, error.message);
+  if (error.code === 'BAD_AREA') throw createHttpError(400, error.message);
+  if (error.code === 'COOKIE_REJECTED') throw createHttpError(409, error.message);
+  if (error.code === 'STORAGE_WRITE_FAILED' || error.code === 'PAGE_UNREADABLE') throw createHttpError(502, error.message);
+  throw error;
+}
+
+async function handleGetStorage(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  try {
+    const storage = await cdpClient.storageSnapshot(instance.host, instance.port, req.params.tabId);
+    res.json({ instance_id: instance.id, tab_id: req.params.tabId, ...storage });
+  } catch (error) {
+    rethrowStorageError(error);
+  }
+}
+
+async function handleSetStorage(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const body = req.body || {};
+  const area = storageAreaFromParams(body.area);
+  const key = body.key ?? body.name;
+  if (typeof key !== 'string' || key === '') {
+    throw createHttpError(400, 'Send the item name as "key"');
+  }
+  if (typeof body.value !== 'string') {
+    throw createHttpError(400, '"value" is required and must be a string');
+  }
+
+  try {
+    if (area === 'cookies') {
+      const result = await cdpClient.cookieSet(instance.host, instance.port, req.params.tabId, {
+        name: key,
+        value: body.value,
+        domain: normalizeString(body.domain) || null,
+        path: normalizeString(body.path) || null,
+      });
+      res.json({ success: true, area, ...result });
+      return;
+    }
+    const result = await cdpClient.storageSetItem(instance.host, instance.port, req.params.tabId, {
+      area, key, value: body.value,
+    });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    rethrowStorageError(error);
+  }
+}
+
+async function handleDeleteStorage(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const area = storageAreaFromParams(req.params.area);
+  const key = req.query?.key;
+  const wantsClear = isTruthy(req.query?.clear);
+
+  // One or the other, said explicitly. A delete that wipes the whole store
+  // because a query parameter went missing is not a mistake worth allowing.
+  if (!wantsClear && (typeof key !== 'string' || key === '')) {
+    throw createHttpError(400, 'Name the item with ?key=<name>, or pass ?clear=1 to empty the whole area');
+  }
+  if (wantsClear && typeof key === 'string' && key !== '') {
+    throw createHttpError(400, 'Pass either ?key=<name> or ?clear=1, not both');
+  }
+
+  try {
+    if (wantsClear) {
+      const result = area === 'cookies'
+        ? await cdpClient.cookieClear(instance.host, instance.port, req.params.tabId)
+        : await cdpClient.storageClearArea(instance.host, instance.port, req.params.tabId, area);
+      res.json({ success: true, area, cleared: true, ...result });
+      return;
+    }
+    const result = area === 'cookies'
+      ? await cdpClient.cookieRemove(instance.host, instance.port, req.params.tabId, {
+        name: key,
+        domain: normalizeString(req.query?.domain) || null,
+        path: normalizeString(req.query?.path) || null,
+      })
+      : await cdpClient.storageRemoveItem(instance.host, instance.port, req.params.tabId, { area, key });
+    res.json({ success: true, area, cleared: false, ...result });
+  } catch (error) {
+    rethrowStorageError(error);
+  }
+}
+
 async function handleGetTabSelection(req, res) {
   const instance = getInstanceByIdOrThrow(req.params.id);
   const selection = await cdpClient.getSelection(instance.host, instance.port, req.params.tabId);
@@ -1628,6 +1769,16 @@ function registerRoutes(router) {
   router.get('/instances/:id/tabs/:tabId/network', withErrorBoundary(handleNetworkList));
   router.delete('/instances/:id/tabs/:tabId/network', withErrorBoundary(handleNetworkClear));
   router.get('/instances/:id/tabs/:tabId/network/:requestId', withErrorBoundary(handleNetworkRequest));
+  // Same ordering reason as the network log: the literal paths first, so
+  // "start" is never read as something else.
+  router.post('/instances/:id/tabs/:tabId/console/start', withErrorBoundary(handleConsoleStart));
+  router.post('/instances/:id/tabs/:tabId/console/stop', withErrorBoundary(handleConsoleStop));
+  router.post('/instances/:id/tabs/:tabId/console/eval', withErrorBoundary(handleConsoleEval));
+  router.get('/instances/:id/tabs/:tabId/console', withErrorBoundary(handleConsoleList));
+  router.delete('/instances/:id/tabs/:tabId/console', withErrorBoundary(handleConsoleClear));
+  router.get('/instances/:id/tabs/:tabId/storage', withErrorBoundary(handleGetStorage));
+  router.post('/instances/:id/tabs/:tabId/storage', withErrorBoundary(handleSetStorage));
+  router.delete('/instances/:id/tabs/:tabId/storage/:area', withErrorBoundary(handleDeleteStorage));
   router.post('/instances/:id/cookies/import', withErrorBoundary(handleImportCookies));
   router.post('/instances/:id/session/import', withErrorBoundary(handleImportSession));
   router.get('/instances/:id/cookies', withErrorBoundary(handleExportCookies));

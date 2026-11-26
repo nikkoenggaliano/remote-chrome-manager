@@ -569,6 +569,164 @@ has polled for a couple of minutes (`NETWORK_LOG_IDLE_MS`). The buffer keeps
 the most recent `NETWORK_LOG_MAX` requests, 500 by default, and reports how
 many it had to drop.
 
+### Console
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/instances/:id/tabs/:tabId/console/start` | Start recording this tab's console |
+| `GET` | `/instances/:id/tabs/:tabId/console` | Read the transcript |
+| `POST` | `/instances/:id/tabs/:tabId/console/eval` | Run an expression at the prompt |
+| `DELETE` | `/instances/:id/tabs/:tabId/console` | Clear the transcript, keep recording |
+| `POST` | `/instances/:id/tabs/:tabId/console/stop` | Stop recording and drop it |
+
+```bash
+curl -X POST -H "$AUTH" $BASE/instances/$ID/tabs/$TAB/console/start
+curl -H "$AUTH" "$BASE/instances/$ID/tabs/$TAB/console?since_seq=0"
+```
+
+```json
+{
+  "recording": true, "connected": true, "generation": 1,
+  "next_seq": 12, "total": 12, "dropped": 0, "max_entries": 1000,
+  "entries": [
+    { "id": "c4", "seq": 4, "kind": "console", "level": "warn",
+      "text": "checkout: falling back to the v1 endpoint",
+      "source": "console.warning", "url": "https://app.example.com/main.js",
+      "line": 812, "stack": null, "timestamp": 1764052991337 },
+    { "id": "c7", "seq": 7, "kind": "exception", "level": "error",
+      "text": "TypeError: Cannot read properties of null (reading 'id')",
+      "source": "javascript", "line": 44,
+      "stack": [{ "function": "renderRow", "url": "https://app.example.com/main.js", "line": 44, "column": 17 }],
+      "timestamp": 1764052991402 }
+  ]
+}
+```
+
+Poll with `since_seq` set to the previous `next_seq`, exactly as for the network
+log, and resync from `0` if `generation` changes.
+
+What ends up in the transcript, told apart by `kind`:
+
+- `console` — a `console.*` call. Its arguments are already rendered: format
+  specifiers substituted, objects described (`{alpha: 1, nested: Object}`)
+  rather than flattened to `[object Object]`.
+- `exception` — something nobody caught, with the stack.
+- `browser` — a message the browser raised about the page: a CSP violation,
+  blocked mixed content, a deprecation, a failed load. The page never logged
+  these, so `console` alone would not show them.
+- `input` / `result` — an expression someone sent to `console/eval` and the
+  answer, kept in order so the log reads as a session.
+- `notice` — a remark from the recorder itself: a navigation, or a page calling
+  `console.clear()`, which is recorded rather than obeyed. The transcript
+  belongs to whoever is watching, not to the code being watched.
+
+Attaching replays what Chrome had already buffered for the tab, so the
+transcript opens with the page's history rather than with nothing. Those
+replayed lines are thinner: an object logged earlier arrives as a bare handle,
+and where the context it came from is gone (the page has navigated since) its
+one-word description is all there is. Reload the tab to record a page in full.
+
+```bash
+curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"expression":"Object.keys(window.__NEXT_DATA__.props)"}' \
+  $BASE/instances/$ID/tabs/$TAB/console/eval
+# {"ok":true,"threw":false,"text":"[\n  \"pageProps\"\n]","type":"object","subtype":"array",
+#  "input_id":"c11","entry_id":"c12"}
+```
+
+`eval` runs in the page's main world with the DevTools command line API
+available, so `$('a')`, `$$('.row')`, `$0`, `keys()` and `copy()` work, and
+`let x = 1` can be sent twice without a redeclaration error. A promise is
+awaited; one that never settles comes back as `Promise {<pending>}` rather than
+hanging. An object is serialised where it lives and comes back as a readable
+dump — depth- and size-capped, with cycles named and a getter that throws
+reported as such instead of losing the rest of the object.
+
+An expression that throws answers **200** with `ok: false`, `threw: true` and
+the page's own message. That is a result, not a server fault. Recording starts
+if it was not already running; use `POST /tabs/:tabId/evaluate` when you want a
+single value and no transcript.
+
+A recorder holds its own CDP session and stops itself once nothing has polled
+for a couple of minutes (`CONSOLE_LOG_IDLE_MS`), keeping the most recent
+`CONSOLE_LOG_MAX` lines, 1000 by default.
+
+### Storage
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/instances/:id/tabs/:tabId/storage` | localStorage, sessionStorage and cookies in one read |
+| `POST` | `/instances/:id/tabs/:tabId/storage` | Write one item or cookie |
+| `DELETE` | `/instances/:id/tabs/:tabId/storage/:area` | `?key=<name>` for one item, or `?clear=1` for the whole area |
+
+```bash
+curl -H "$AUTH" $BASE/instances/$ID/tabs/$TAB/storage
+```
+
+```json
+{
+  "url": "https://app.example.com/dashboard",
+  "origin": "https://app.example.com",
+  "has_storage": true,
+  "local": {
+    "source": "cdp", "error": null, "bytes": 96,
+    "items": [{ "key": "access_token", "value": "eyJhbGciOiJIUzI1NiJ9…", "bytes": 84 }]
+  },
+  "session": { "source": "cdp", "error": null, "bytes": 0, "items": [] },
+  "cookies": {
+    "error": null,
+    "items": [{ "name": "sid", "value": "s%3Aabc123", "domain": ".example.com", "path": "/",
+                "expires": null, "size": 16, "http_only": true, "secure": true,
+                "same_site": "Lax", "session": true }]
+  },
+  "read_at": 1764052991337
+}
+```
+
+The stores are read from the browser side wherever Chrome will name them
+(`source: "cdp"`), which is immune to anything the document has done to its own
+`localStorage` global, and which is why `httpOnly` cookie values come back in
+full. Where it will not — partitioned contexts, protocol shapes that differ
+between builds — the area is read by running script in the page instead and
+says so with `source: "page"`.
+
+Cookies are every cookie the site would see, matched on host rather than on
+this exact URL: one scoped to `/admin` is still the site's cookie, and leaving
+it out is how you wrongly conclude it is not set.
+
+A tab on `about:blank` or a `data:` URL has an opaque origin and therefore no
+storage at all. That answers `origin: null` and `has_storage: false` rather
+than with empty stores that look real; writing to it is a `409`.
+
+```bash
+# write one item
+curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"area":"local","key":"access_token","value":"eyJhbGciOiJIUzI1NiJ9…"}' \
+  $BASE/instances/$ID/tabs/$TAB/storage
+
+# change a cookie's value, keeping its flags
+curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"area":"cookies","key":"sid","value":"s%3Anew"}' \
+  $BASE/instances/$ID/tabs/$TAB/storage
+
+# drop one item, then empty the area
+curl -X DELETE -H "$AUTH" "$BASE/instances/$ID/tabs/$TAB/storage/local?key=access_token"
+curl -X DELETE -H "$AUTH" "$BASE/instances/$ID/tabs/$TAB/storage/session?clear=1"
+```
+
+Editing a cookie keeps the flags it already had: an `httpOnly`, `Secure`,
+`SameSite=None` cookie is still all three afterwards. A cookie that does not
+exist yet is created for the page's own host at `/`; pass `domain` and `path`
+to pick between same-named cookies on different scopes.
+
+A `DELETE` naming neither `key` nor `clear` is a **400**, and so is one naming
+both. A missing query parameter emptying a store is not a mistake worth
+allowing.
+
+Everything here applies to the origin the tab is **currently on**. To write a
+whole session into an origin the tab is not on yet, use
+`POST /instances/:id/session/import`.
+
 ### Clipboard
 
 | Method | Path | Purpose |

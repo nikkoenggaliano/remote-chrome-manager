@@ -1068,6 +1068,8 @@ function resetControlView() {
     lastViewport = null;
     stopStream();
     closeNetworkPanel({ stopRecorder: true });
+    closeConsolePanel({ stopRecorder: true });
+    closeStoragePanel();
     hidePasteBox();
     currentEmulation = null;
     renderDeviceButtons();
@@ -1186,12 +1188,14 @@ function selectTab(id) {
     tabList.querySelectorAll('[data-tab-id]').forEach(el =>
         el.classList.toggle('active', el.getAttribute('data-tab-id') === id));
 
-    // Emulation and the network log both belong to a tab, not to the instance,
-    // so switching tabs has to re-point them or the panel would show one tab's
-    // traffic while the view shows another's.
+    // Emulation and every drawer panel belong to a tab, not to the instance, so
+    // switching tabs has to re-point them - otherwise a panel would show one
+    // tab's traffic, console or storage while the view shows another's.
     lastViewport = null;
     loadEmulation(id);
     if (networkOpen && networkTabId !== id) startNetworkForCurrentTab();
+    if (consoleOpen && consoleTabId !== id) startConsoleForCurrentTab();
+    if (storageOpen && storageTabId !== id) { closeStorageItemModal(); loadStorage(); }
 
     // Bring the target tab to the foreground (best effort) then start the view.
     fetchAPI(`/api/instances/${currentInstanceId}/tabs/${id}/activate`, 'POST').catch(() => {});
@@ -2154,6 +2158,7 @@ document.addEventListener('paste', (e) => {
     if (!controlModalOpen || !currentTabId) return;
     if (!pasteBox.classList.contains('d-none')) return;   // the box takes its own
     if (networkModalOpen) return;                         // so does the request popup
+    if (storageModalOpen) return;                         // and the storage item editor
     const inControl = document.activeElement === screenWrapper || screenWrapper.classList.contains('has-focus');
     if (!inControl) return;
     const text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
@@ -2194,6 +2199,7 @@ function resetNetworkBuffer() {
 }
 
 function openNetworkPanel() {
+    closeOtherDrawers('network');
     networkOpen = true;
     networkPanel.classList.remove('d-none');
     networkPanel.classList.add('d-flex');
@@ -2708,6 +2714,836 @@ document.getElementById('btnNetworkClear').addEventListener('click', async () =>
         showControlNotice(error.message || 'Could not clear the log', 'bad');
     }
 });
+
+// --- The drawer -----------------------------------------------------------
+// Network, console and storage share one strip under the live view, and only
+// one of them holds it at a time: three panels in a 42% slice would each be too
+// short to read, and the live page would be left with nothing.
+function closeOtherDrawers(keep) {
+    if (keep !== 'network' && networkOpen) closeNetworkPanel();
+    if (keep !== 'console' && consoleOpen) closeConsolePanel();
+    if (keep !== 'storage' && storageOpen) closeStoragePanel();
+}
+
+// --- Console panel ---------------------------------------------------------
+// The page's own console, over the wire: what it logged, what it threw, and
+// what the browser said about it. Plus a prompt - half of what a console is for
+// is asking the page a question rather than waiting for it to volunteer one.
+
+const CONSOLE_POLL_MS = 1000;
+const CONSOLE_HISTORY_MAX = 100;
+
+const consolePanel = document.getElementById('consolePanel');
+const consoleLog = document.getElementById('consoleLog');
+const consoleEmpty = document.getElementById('consoleEmpty');
+const consoleInput = document.getElementById('consoleInput');
+const consoleFilter = document.getElementById('consoleFilter');
+const consoleLevelFilter = document.getElementById('consoleLevelFilter');
+const consoleCount = document.getElementById('consoleCount');
+const consoleStatusDot = document.getElementById('consoleStatusDot');
+const btnConsoleToggle = document.getElementById('btnConsoleToggle');
+const btnConsoleRun = document.getElementById('btnConsoleRun');
+
+let consoleOpen = false;
+let consoleInstanceId = null;
+let consoleTabId = null;
+let consoleEntries = [];
+let consoleCursor = 0;
+let consoleGeneration = 0;
+let consolePollTimer = null;
+let consoleDropped = 0;
+let consoleRenderSignature = '';
+let consoleHistory = [];
+let consoleHistoryAt = -1;   // -1 means "at the live line, not in the history"
+let consoleHistoryDraft = '';
+let consoleRunning = false;
+let consoleExpanded = new Set();
+
+function setConsoleStatus(state) {
+    const map = { idle: 'status-stopped', loading: 'status-partial', live: 'streaming', error: 'status-stopped' };
+    consoleStatusDot.className = `status-indicator ${map[state] || map.idle}`;
+}
+
+function resetConsoleBuffer() {
+    consoleEntries = [];
+    consoleCursor = 0;
+    consoleGeneration = 0;
+    consoleDropped = 0;
+    consoleRenderSignature = '';
+    consoleExpanded = new Set();
+    consoleLog.innerHTML = '';
+    consoleLog.appendChild(consoleEmpty);
+    consoleEmpty.classList.remove('d-none');
+    consoleEmpty.textContent = 'Recording. Anything the page logs from now on lands here.';
+    consoleCount.textContent = 'nothing logged yet';
+}
+
+function openConsolePanel() {
+    closeOtherDrawers('console');
+    consoleOpen = true;
+    consolePanel.classList.remove('d-none');
+    consolePanel.classList.add('d-flex');
+    btnConsoleToggle.classList.add('active');
+    startConsoleForCurrentTab();
+    consoleInput.focus({ preventScroll: true });
+}
+
+function closeConsolePanel(options = {}) {
+    const { stopRecorder = true } = options;
+    const previousInstance = consoleInstanceId;
+    const previousTab = consoleTabId;
+
+    consoleOpen = false;
+    consolePanel.classList.add('d-none');
+    consolePanel.classList.remove('d-flex');
+    btnConsoleToggle.classList.remove('active');
+    stopConsolePoll();
+    setConsoleStatus('idle');
+    consoleInstanceId = null;
+    consoleTabId = null;
+
+    // Captured above: this also runs as the control modal closes, by which time
+    // the current instance has already been cleared.
+    if (stopRecorder && previousInstance && previousTab) {
+        fetchAPI(`/api/instances/${previousInstance}/tabs/${previousTab}/console/stop`, 'POST').catch(() => {});
+    }
+}
+
+async function startConsoleForCurrentTab() {
+    if (!currentInstanceId || !currentTabId) return;
+
+    if (consoleInstanceId && consoleTabId && consoleTabId !== currentTabId) {
+        fetchAPI(`/api/instances/${consoleInstanceId}/tabs/${consoleTabId}/console/stop`, 'POST').catch(() => {});
+    }
+
+    consoleInstanceId = currentInstanceId;
+    consoleTabId = currentTabId;
+    resetConsoleBuffer();
+    setConsoleStatus('loading');
+
+    try {
+        const status = await fetchJsonOrThrow(
+            `/api/instances/${currentInstanceId}/tabs/${currentTabId}/console/start`, { method: 'POST' });
+        consoleGeneration = status.generation;
+        setConsoleStatus('live');
+        startConsolePoll();
+    } catch (error) {
+        setConsoleStatus('error');
+        consoleEmpty.textContent = `Could not attach to the console: ${error.message}`;
+        consoleEmpty.classList.remove('d-none');
+    }
+}
+
+function startConsolePoll() {
+    stopConsolePoll();
+    pollConsole();
+    consolePollTimer = setInterval(pollConsole, CONSOLE_POLL_MS);
+}
+
+function stopConsolePoll() {
+    if (consolePollTimer) clearInterval(consolePollTimer);
+    consolePollTimer = null;
+}
+
+async function pollConsole() {
+    if (!consoleOpen || !consoleInstanceId || !consoleTabId) return;
+    try {
+        const res = await fetchJsonOrThrow(
+            `/api/instances/${consoleInstanceId}/tabs/${consoleTabId}/console?since_seq=${consoleCursor}&limit=500`);
+        if (!consoleOpen) return;
+
+        if (!res.recording) {
+            setConsoleStatus('error');
+            consoleEmpty.textContent = 'Recording stopped. Close and reopen the panel to start again.';
+            consoleEmpty.classList.remove('d-none');
+            stopConsolePoll();
+            return;
+        }
+
+        // A cleared transcript is a different transcript; keeping the old lines
+        // would mean showing a cursor that will never come round again.
+        if (consoleGeneration && res.generation !== consoleGeneration) {
+            resetConsoleBuffer();
+            consoleGeneration = res.generation;
+            return;
+        }
+        consoleGeneration = res.generation;
+
+        if (res.entries.length) consoleEntries = consoleEntries.concat(res.entries);
+        consoleCursor = res.next_seq;
+        consoleDropped = res.dropped;
+
+        const cap = res.max_entries || 1000;
+        if (consoleEntries.length > cap) consoleEntries = consoleEntries.slice(-cap);
+
+        setConsoleStatus(res.connected ? 'live' : 'error');
+        renderConsoleLog();
+    } catch (error) {
+        setConsoleStatus('error');
+    }
+}
+
+function consoleMatches(entry) {
+    const text = consoleFilter.value.trim().toLowerCase();
+    if (text && !String(entry.text || '').toLowerCase().includes(text)) return false;
+    const level = consoleLevelFilter.value;
+    // A level filter is about the page's output; the prompt and its answers are
+    // the operator's own and are never filtered away under them.
+    if (level && entry.level !== level && entry.kind !== 'input' && entry.kind !== 'result') return false;
+    return true;
+}
+
+const CONSOLE_ICONS = {
+    error: 'bi-x-octagon-fill',
+    warn: 'bi-exclamation-triangle-fill',
+    info: 'bi-info-circle-fill',
+    debug: 'bi-bug',
+    input: 'bi-chevron-right',
+    result: 'bi-arrow-return-left',
+    log: 'bi-circle-fill',
+};
+
+function consoleOriginLabel(entry) {
+    if (!entry.url) return '';
+    let tail = entry.url;
+    try {
+        const url = new URL(entry.url);
+        const parts = url.pathname.split('/').filter(Boolean);
+        tail = parts.length ? parts[parts.length - 1] : url.host;
+    } catch (error) { /* an eval or an anonymous script has no proper URL */ }
+    return entry.line ? `${tail}:${entry.line}` : tail;
+}
+
+function consoleStackText(entry) {
+    if (!entry.stack || !entry.stack.length) return '';
+    return entry.stack
+        .map((frame) => `at ${frame.function} (${frame.url || 'unknown'}${frame.line ? `:${frame.line}` : ''})`)
+        .join('\n');
+}
+
+function consoleRow(entry) {
+    const stack = consoleStackText(entry);
+    const expanded = consoleExpanded.has(entry.id);
+    const icon = CONSOLE_ICONS[entry.level] || CONSOLE_ICONS.log;
+    const origin = consoleOriginLabel(entry);
+
+    return `<div class="console-row lvl-${escapeAttr(entry.level)} kind-${escapeAttr(entry.kind)}${stack ? ' has-stack' : ''}"
+                 data-console-id="${escapeAttr(entry.id)}">
+        <span class="console-gutter"><i class="bi ${icon}" style="font-size:${entry.level === 'log' ? '0.4rem' : '0.7rem'};"></i></span>
+        <span class="console-text">${escapeHtml(entry.text)}</span>
+        <span class="d-flex align-items-center gap-1">
+            <button type="button" class="console-copy" data-console-copy="${escapeAttr(entry.id)}" title="Copy this line"><i class="bi bi-clipboard"></i></button>
+            <span class="console-origin" title="${escapeAttr(entry.url || '')}">${escapeHtml(origin)}</span>
+        </span>
+        ${stack ? `<div class="console-stack${expanded ? '' : ' d-none'}">${escapeHtml(stack)}</div>` : ''}
+    </div>`;
+}
+
+function renderConsoleLog() {
+    const rows = consoleEntries.filter(consoleMatches);
+    const signature = `${rows.map((entry) => entry.id).join(',')}|${[...consoleExpanded].join(',')}`;
+    if (signature === consoleRenderSignature) return;
+    consoleRenderSignature = signature;
+
+    // Follow the tail the way a console does, but only when the reader is
+    // already at the bottom: yanking the view while they read an error is worse
+    // than missing the newest line.
+    const atBottom = (consoleLog.scrollHeight - consoleLog.scrollTop - consoleLog.clientHeight) < 48;
+
+    consoleLog.innerHTML = rows.length
+        ? rows.map(consoleRow).join('')
+        : '';
+    if (!rows.length) {
+        consoleLog.appendChild(consoleEmpty);
+        consoleEmpty.classList.remove('d-none');
+        consoleEmpty.textContent = consoleEntries.length
+            ? `${consoleEntries.length} line(s) recorded, none match the filter.`
+            : 'Recording. Anything the page logs from now on lands here.';
+    }
+
+    const dropped = consoleDropped ? `, ${consoleDropped} dropped` : '';
+    const errors = consoleEntries.filter((entry) => entry.level === 'error').length;
+    const warnings = consoleEntries.filter((entry) => entry.level === 'warn').length;
+    const tally = [errors ? `${errors} error(s)` : '', warnings ? `${warnings} warning(s)` : ''].filter(Boolean).join(', ');
+    consoleCount.textContent = rows.length === consoleEntries.length
+        ? `${consoleEntries.length} line(s)${tally ? ` — ${tally}` : ''}${dropped}`
+        : `${rows.length} of ${consoleEntries.length}${dropped}`;
+
+    if (atBottom) consoleLog.scrollTop = consoleLog.scrollHeight;
+}
+
+consoleLog.addEventListener('click', (e) => {
+    const copyButton = e.target.closest('[data-console-copy]');
+    if (copyButton) {
+        const entry = consoleEntries.find((item) => item.id === copyButton.getAttribute('data-console-copy'));
+        if (!entry) return;
+        const stack = consoleStackText(entry);
+        copyConsoleText(stack ? `${entry.text}\n${stack}` : entry.text, 'the line');
+        return;
+    }
+    const row = e.target.closest('[data-console-id]');
+    if (!row || !row.classList.contains('has-stack')) return;
+    const id = row.getAttribute('data-console-id');
+    if (consoleExpanded.has(id)) consoleExpanded.delete(id);
+    else consoleExpanded.add(id);
+    consoleRenderSignature = '';
+    renderConsoleLog();
+});
+
+async function copyConsoleText(text, label) {
+    const ok = await writeClipboardText(text);
+    showControlNotice(ok ? `Copied ${label}` : 'Your browser blocked the clipboard', ok ? 'good' : 'bad');
+}
+
+[consoleFilter, consoleLevelFilter].forEach((el) => {
+    el.addEventListener('input', () => { consoleRenderSignature = ''; renderConsoleLog(); });
+    el.addEventListener('change', () => { consoleRenderSignature = ''; renderConsoleLog(); });
+});
+
+// --- The prompt -----------------------------------------------------------
+
+function sizeConsoleInput() {
+    const lines = Math.min(6, Math.max(1, consoleInput.value.split('\n').length));
+    consoleInput.rows = lines;
+}
+
+async function runConsoleInput() {
+    const expression = consoleInput.value.trim();
+    if (!expression || consoleRunning) return;
+    if (!consoleInstanceId || !consoleTabId) {
+        showControlNotice('The console is not attached to a tab', 'bad');
+        return;
+    }
+
+    // History keeps one copy of a repeated line, the way a shell does.
+    if (consoleHistory[consoleHistory.length - 1] !== expression) consoleHistory.push(expression);
+    if (consoleHistory.length > CONSOLE_HISTORY_MAX) consoleHistory.shift();
+    consoleHistoryAt = -1;
+    consoleHistoryDraft = '';
+
+    consoleInput.value = '';
+    sizeConsoleInput();
+    consoleRunning = true;
+    btnConsoleRun.disabled = true;
+
+    try {
+        await fetchJsonOrThrow(`/api/instances/${consoleInstanceId}/tabs/${consoleTabId}/console/eval`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ expression }),
+        });
+        // The expression and its answer are both appended to the transcript by
+        // the server, so one poll right now shows them instead of waiting out
+        // the interval.
+        await pollConsole();
+        consoleLog.scrollTop = consoleLog.scrollHeight;
+    } catch (error) {
+        showControlNotice(error.message || 'Could not run it', 'bad');
+    } finally {
+        consoleRunning = false;
+        btnConsoleRun.disabled = false;
+        consoleInput.focus({ preventScroll: true });
+    }
+}
+
+function walkConsoleHistory(delta) {
+    if (!consoleHistory.length) return;
+    if (consoleHistoryAt === -1) {
+        if (delta > 0) return;             // already at the live line
+        consoleHistoryDraft = consoleInput.value;
+        consoleHistoryAt = consoleHistory.length - 1;
+    } else {
+        const next = consoleHistoryAt + (delta > 0 ? 1 : -1);
+        if (next < 0) return;
+        if (next >= consoleHistory.length) {
+            consoleHistoryAt = -1;
+            consoleInput.value = consoleHistoryDraft;
+            sizeConsoleInput();
+            return;
+        }
+        consoleHistoryAt = next;
+    }
+    consoleInput.value = consoleHistory[consoleHistoryAt];
+    sizeConsoleInput();
+    const end = consoleInput.value.length;
+    consoleInput.setSelectionRange(end, end);
+}
+
+consoleInput.addEventListener('input', () => sizeConsoleInput());
+
+consoleInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        runConsoleInput();
+        return;
+    }
+    if (e.key === 'Escape') {
+        // The prompt is inside the control modal, and Bootstrap closes a modal
+        // on Escape. Clearing the line is what Escape means at a prompt, and
+        // tearing down the whole control view is not.
+        e.preventDefault();
+        e.stopPropagation();
+        consoleInput.value = '';
+        consoleHistoryAt = -1;
+        sizeConsoleInput();
+        return;
+    }
+    // Only when the caret is on the first (or last) line, so the arrows still
+    // move around inside a multi-line expression.
+    const before = consoleInput.value.slice(0, consoleInput.selectionStart);
+    const after = consoleInput.value.slice(consoleInput.selectionEnd);
+    if (e.key === 'ArrowUp' && !before.includes('\n')) {
+        e.preventDefault();
+        walkConsoleHistory(-1);
+    } else if (e.key === 'ArrowDown' && !after.includes('\n')) {
+        e.preventDefault();
+        walkConsoleHistory(1);
+    }
+});
+
+btnConsoleToggle.addEventListener('click', () => {
+    if (consoleOpen) closeConsolePanel();
+    else openConsolePanel();
+});
+btnConsoleRun.addEventListener('click', () => runConsoleInput());
+document.getElementById('btnConsolePanelClose').addEventListener('click', () => closeConsolePanel());
+
+document.getElementById('btnConsoleClear').addEventListener('click', async () => {
+    if (!consoleInstanceId || !consoleTabId) return;
+    try {
+        await fetchJsonOrThrow(`/api/instances/${consoleInstanceId}/tabs/${consoleTabId}/console`, { method: 'DELETE' });
+        resetConsoleBuffer();
+    } catch (error) {
+        showControlNotice(error.message || 'Could not clear the transcript', 'bad');
+    }
+});
+
+// A console only sees what is logged while it is listening, and most of what a
+// page has to say it says while loading. So: a reload, from here.
+document.getElementById('btnConsoleReload').addEventListener('click', async () => {
+    if (!currentInstanceId || !currentTabId) return;
+    try {
+        await fetchJsonOrThrow(`/api/instances/${currentInstanceId}/tabs/${currentTabId}/reload`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ignore_cache: false }),
+        });
+        showControlNotice('Reloading — what the page logs on the way up is recorded', 'good');
+        nudge(400);
+    } catch (error) {
+        showControlNotice(error.message || 'Could not reload', 'bad');
+    }
+});
+
+document.getElementById('btnConsoleCopy').addEventListener('click', () => {
+    const rows = consoleEntries.filter(consoleMatches);
+    if (!rows.length) { showControlNotice('There is nothing in the transcript yet', 'bad'); return; }
+    // Written out the way it reads on screen, with the level in front, so a
+    // transcript pasted into a ticket still says which lines were the errors.
+    const text = rows.map((entry) => {
+        const stack = consoleStackText(entry);
+        const head = `[${entry.level}] ${entry.text}`;
+        return stack ? `${head}\n${stack.split('\n').map((line) => `    ${line}`).join('\n')}` : head;
+    }).join('\n');
+    copyConsoleText(text, `the transcript (${rows.length} line(s))`);
+});
+
+// --- Storage panel ---------------------------------------------------------
+// The browser's Application panel for the tab in front of you: localStorage,
+// sessionStorage and cookies for whatever origin it is on, and the means to
+// change any of them. Read on demand rather than polled - storage changes
+// because something changed it, not on its own, and a table that rewrites
+// itself every second is one you cannot click on.
+
+const storagePanel = document.getElementById('storagePanel');
+const storageRows = document.getElementById('storageRows');
+const storageHead = document.getElementById('storageHead');
+const storageEmpty = document.getElementById('storageEmpty');
+const storageFilter = document.getElementById('storageFilter');
+const storageOriginLabel = document.getElementById('storageOrigin');
+const storageStatusDot = document.getElementById('storageStatusDot');
+const btnStorageToggle = document.getElementById('btnStorageToggle');
+
+const storageItemModal = document.getElementById('storageItemModal');
+const storageItemDialog = storageItemModal.querySelector('.net-modal-dialog');
+const storageItemArea = document.getElementById('storageItemArea');
+const storageItemTitle = document.getElementById('storageItemTitle');
+const storageItemMeta = document.getElementById('storageItemMeta');
+const storageItemKey = document.getElementById('storageItemKey');
+const storageItemValue = document.getElementById('storageItemValue');
+const storageItemHint = document.getElementById('storageItemHint');
+const btnStorageItemDelete = document.getElementById('btnStorageItemDelete');
+
+let storageOpen = false;
+let storageInstanceId = null;
+let storageTabId = null;
+let storageArea = 'local';
+let storageData = null;
+let storageLoadToken = 0;
+let storageModalOpen = false;
+let storageEditing = null;      // the row being edited, or a blank for a new one
+let storageModalOpener = null;  // element to hand focus back to on close
+
+function setStorageStatus(state) {
+    const map = { idle: 'status-stopped', loading: 'status-partial', live: 'streaming', error: 'status-stopped' };
+    storageStatusDot.className = `status-indicator ${map[state] || map.idle}`;
+}
+
+function openStoragePanel() {
+    closeOtherDrawers('storage');
+    storageOpen = true;
+    storagePanel.classList.remove('d-none');
+    storagePanel.classList.add('d-flex');
+    btnStorageToggle.classList.add('active');
+    storageInstanceId = currentInstanceId;
+    storageTabId = currentTabId;
+    loadStorage();
+}
+
+function closeStoragePanel() {
+    storageOpen = false;
+    closeStorageItemModal();
+    storagePanel.classList.add('d-none');
+    storagePanel.classList.remove('d-flex');
+    btnStorageToggle.classList.remove('active');
+    setStorageStatus('idle');
+    storageInstanceId = null;
+    storageTabId = null;
+    storageData = null;
+    storageLoadToken += 1;
+}
+
+async function loadStorage() {
+    if (!storageOpen) return;
+    storageInstanceId = currentInstanceId;
+    storageTabId = currentTabId;
+    if (!storageInstanceId || !storageTabId) return;
+
+    const token = ++storageLoadToken;
+    setStorageStatus('loading');
+    try {
+        const res = await fetchJsonOrThrow(`/api/instances/${storageInstanceId}/tabs/${storageTabId}/storage`);
+        // A snapshot that arrives after a newer one was asked for is stale, and
+        // showing it would mean the panel disagreeing with the tab it names.
+        if (token !== storageLoadToken || !storageOpen) return;
+        storageData = res;
+        setStorageStatus(res.has_storage ? 'live' : 'error');
+        renderStorage();
+    } catch (error) {
+        if (token !== storageLoadToken || !storageOpen) return;
+        storageData = null;
+        setStorageStatus('error');
+        storageHead.innerHTML = '';
+        storageRows.innerHTML = '';
+        storageEmpty.classList.remove('d-none');
+        storageEmpty.textContent = `Could not read the storage: ${error.message}`;
+    }
+}
+
+function storageAreaItems(area) {
+    if (!storageData) return [];
+    if (area === 'cookies') return storageData.cookies?.items || [];
+    return storageData[area]?.items || [];
+}
+
+function storageRowMatches(row) {
+    const text = storageFilter.value.trim().toLowerCase();
+    if (!text) return true;
+    const name = String(row.key ?? row.name ?? '').toLowerCase();
+    return name.includes(text) || String(row.value || '').toLowerCase().includes(text);
+}
+
+// One line of it, enough to tell rows apart. The whole value is a click away,
+// and a 40 KB token pasted into a table cell only makes the table unusable.
+function storageValuePreview(value) {
+    const flat = String(value ?? '').replace(/\s+/g, ' ').trim();
+    return flat.length > 300 ? `${flat.slice(0, 300)}…` : flat;
+}
+
+function cookieFlags(cookie) {
+    const flags = [];
+    if (cookie.http_only) flags.push('HttpOnly');
+    if (cookie.secure) flags.push('Secure');
+    if (cookie.same_site) flags.push(cookie.same_site);
+    if (cookie.session) flags.push('Session');
+    return flags.map((flag) => `<span class="storage-flag">${escapeHtml(flag)}</span>`).join('');
+}
+
+function renderStorage() {
+    document.querySelectorAll('[data-storage-area]').forEach((button) => {
+        button.classList.toggle('active', button.getAttribute('data-storage-area') === storageArea);
+    });
+
+    document.getElementById('storageCountLocal').innerText = storageAreaItems('local').length;
+    document.getElementById('storageCountSession').innerText = storageAreaItems('session').length;
+    document.getElementById('storageCountCookies').innerText = storageAreaItems('cookies').length;
+
+    if (!storageData) return;
+
+    const origin = storageData.origin || 'no origin';
+    const area = storageArea === 'cookies' ? null : storageData[storageArea];
+    // Where the numbers came from is part of the answer: read through the page
+    // rather than from the browser, they could have been doctored by the page.
+    const via = area && area.source === 'page' ? ' · read via the page' : '';
+    storageOriginLabel.innerText = `${origin}${via}`;
+    storageOriginLabel.title = `${storageData.url || ''}${via ? '\nChrome would not name this store, so it was read by running script in the page.' : ''}`;
+
+    const all = storageAreaItems(storageArea);
+    const rows = all.filter(storageRowMatches);
+
+    storageHead.innerHTML = storageArea === 'cookies'
+        ? `<th style="width: 24%;">Name</th><th>Value</th><th style="width: 150px;">Domain</th>
+           <th style="width: 70px;">Path</th><th style="width: 180px;">Flags</th><th style="width: 70px;">Size</th>`
+        : `<th style="width: 28%;">Key</th><th>Value</th><th style="width: 80px;">Size</th>`;
+
+    storageRows.innerHTML = rows.map((row, index) => (storageArea === 'cookies'
+        ? `<tr data-storage-row="${index}">
+               <td class="storage-value" title="${escapeAttr(row.name)}">${escapeHtml(row.name)}</td>
+               <td class="storage-value text-theme-muted" title="${escapeAttr(storageValuePreview(row.value))}">${escapeHtml(storageValuePreview(row.value))}</td>
+               <td class="text-theme-muted">${escapeHtml(row.domain)}</td>
+               <td class="text-theme-muted">${escapeHtml(row.path)}</td>
+               <td>${cookieFlags(row)}</td>
+               <td class="font-monospace text-theme-muted">${formatBytes(row.size)}</td>
+           </tr>`
+        : `<tr data-storage-row="${index}">
+               <td class="storage-value" title="${escapeAttr(row.key)}">${escapeHtml(row.key)}</td>
+               <td class="storage-value text-theme-muted" title="${escapeAttr(storageValuePreview(row.value))}">${escapeHtml(storageValuePreview(row.value))}</td>
+               <td class="font-monospace text-theme-muted">${formatBytes(row.bytes)}</td>
+           </tr>`)).join('');
+
+    const areaError = storageArea === 'cookies' ? storageData.cookies?.error : (area && area.error);
+    storageEmpty.classList.toggle('d-none', rows.length > 0);
+    if (!rows.length) {
+        if (!storageData.has_storage) {
+            storageEmpty.textContent = `This tab is on ${storageData.url || 'about:blank'}, which has no origin of its own and therefore no storage. Navigate it to the site first.`;
+        } else if (areaError) {
+            storageEmpty.textContent = `Could not read it: ${areaError}`;
+        } else if (all.length) {
+            storageEmpty.textContent = `${all.length} item(s), none match the filter.`;
+        } else {
+            storageEmpty.textContent = storageArea === 'cookies'
+                ? 'No cookies for this site.'
+                : `Nothing in ${storageArea === 'local' ? 'localStorage' : 'sessionStorage'} for ${origin}.`;
+        }
+    }
+}
+
+document.querySelectorAll('[data-storage-area]').forEach((button) => {
+    button.addEventListener('click', () => {
+        storageArea = button.getAttribute('data-storage-area');
+        renderStorage();
+    });
+});
+
+storageFilter.addEventListener('input', () => renderStorage());
+
+storageRows.addEventListener('click', (e) => {
+    const row = e.target.closest('[data-storage-row]');
+    if (!row) return;
+    const item = storageAreaItems(storageArea).filter(storageRowMatches)[Number(row.getAttribute('data-storage-row'))];
+    if (item) openStorageItemModal(item);
+});
+
+btnStorageToggle.addEventListener('click', () => {
+    if (storageOpen) closeStoragePanel();
+    else openStoragePanel();
+});
+document.getElementById('btnStoragePanelClose').addEventListener('click', () => closeStoragePanel());
+document.getElementById('btnStorageRefresh').addEventListener('click', () => loadStorage());
+document.getElementById('btnStorageAdd').addEventListener('click', () => openStorageItemModal(null));
+
+document.getElementById('btnStorageClear').addEventListener('click', async () => {
+    if (!storageInstanceId || !storageTabId) return;
+    const count = storageAreaItems(storageArea).length;
+    const label = storageArea === 'cookies' ? 'cookies' : (storageArea === 'local' ? 'localStorage' : 'sessionStorage');
+    if (!count) { showControlNotice(`There is nothing in ${label} to empty`, 'bad'); return; }
+
+    const ok = await confirmAction({
+        title: `Empty ${label}?`,
+        // The area is named in the message as well as in the title: this is the
+        // one button here that can sign a session out, and a title is the part
+        // of a dialog people skip.
+        messageHtml: `This removes <strong>${count}</strong> item(s) from <strong>${escapeHtml(label)}</strong> on `
+            + `<strong>${escapeHtml(storageData?.origin || 'this origin')}</strong> in the live browser. `
+            + 'Anything signed in through them will be signed out, and there is no undo.',
+        confirmLabel: `Empty ${label}`,
+    });
+    if (!ok) return;
+
+    try {
+        const res = await fetchJsonOrThrow(
+            `/api/instances/${storageInstanceId}/tabs/${storageTabId}/storage/${storageArea}?clear=1`, { method: 'DELETE' });
+        showControlNotice(`Emptied ${label} — ${res.removed ?? count} item(s)`, 'good');
+        loadStorage();
+    } catch (error) {
+        showControlNotice(error.message || 'Could not empty it', 'bad');
+    }
+});
+
+// --- The item editor ------------------------------------------------------
+
+function openStorageItemModal(item) {
+    storageEditing = item
+        ? { ...item, key: item.key ?? item.name, isNew: false }
+        : { key: '', value: '', isNew: true };
+
+    if (!storageModalOpen) {
+        storageModalOpener = document.activeElement;
+        storageModalOpen = true;
+        storageItemModal.classList.remove('d-none');
+    }
+
+    const areaLabel = storageArea === 'cookies' ? 'cookie' : (storageArea === 'local' ? 'local' : 'session');
+    storageItemArea.innerText = areaLabel;
+    storageItemTitle.innerText = storageEditing.isNew
+        ? `New ${storageArea === 'cookies' ? 'cookie' : 'item'}`
+        : storageEditing.key;
+    storageItemMeta.innerText = storageArea === 'cookies' && !storageEditing.isNew
+        ? `${storageEditing.domain}${storageEditing.path} · ${cookieMetaText(storageEditing)}`
+        : (storageData?.origin || '');
+
+    storageItemKey.value = storageEditing.key || '';
+    storageItemKey.readOnly = !storageEditing.isNew;
+    storageItemValue.value = storageEditing.value || '';
+    btnStorageItemDelete.classList.toggle('d-none', storageEditing.isNew);
+
+    storageItemHint.innerText = storageArea === 'cookies'
+        ? 'The value changes; the flags stay exactly as they are. A new cookie is created for this host at /.'
+        : 'Saved straight into the live browser. The page does not reload, so a page that read this value at startup keeps the old one until it does.';
+
+    (storageEditing.isNew ? storageItemKey : storageItemValue).focus({ preventScroll: true });
+}
+
+function cookieMetaText(cookie) {
+    const parts = [];
+    if (cookie.http_only) parts.push('HttpOnly');
+    if (cookie.secure) parts.push('Secure');
+    if (cookie.same_site) parts.push(`SameSite=${cookie.same_site}`);
+    parts.push(cookie.expires ? `expires ${new Date(cookie.expires * 1000).toLocaleString()}` : 'session cookie');
+    return parts.join(' · ');
+}
+
+function closeStorageItemModal(options = {}) {
+    if (!storageModalOpen) {
+        storageItemModal.classList.add('d-none');
+        return;
+    }
+    const { warnUnsaved = false } = options;
+    const dirty = storageEditing && (storageItemValue.value !== (storageEditing.value || '')
+        || storageItemKey.value !== (storageEditing.key || ''));
+
+    storageModalOpen = false;
+    storageEditing = null;
+    storageItemModal.classList.add('d-none');
+
+    // Said rather than swallowed: closing on an edited value loses the edit,
+    // and a dialog that vanishes silently leaves you unsure whether it saved.
+    if (warnUnsaved && dirty) showControlNotice('Closed without saving', 'bad');
+
+    const opener = storageModalOpener;
+    storageModalOpener = null;
+    if (opener && opener.isConnected && typeof opener.focus === 'function') {
+        try { opener.focus({ preventScroll: true }); } catch (error) { /* gone */ }
+    }
+}
+
+async function saveStorageItem() {
+    if (!storageEditing || !storageInstanceId || !storageTabId) return;
+    const key = storageItemKey.value.trim();
+    if (!key) { showControlNotice('Give the item a key', 'bad'); return; }
+
+    const payload = { area: storageArea, key, value: storageItemValue.value };
+    if (storageArea === 'cookies' && !storageEditing.isNew) {
+        payload.domain = storageEditing.domain;
+        payload.path = storageEditing.path;
+    }
+
+    try {
+        await fetchJsonOrThrow(`/api/instances/${storageInstanceId}/tabs/${storageTabId}/storage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const wasNew = storageEditing.isNew;
+        closeStorageItemModal();
+        showControlNotice(`${wasNew ? 'Added' : 'Saved'} ${key}`, 'good');
+        loadStorage();
+    } catch (error) {
+        showControlNotice(error.message || 'Could not save it', 'bad');
+    }
+}
+
+async function deleteStorageItem() {
+    if (!storageEditing || storageEditing.isNew || !storageInstanceId || !storageTabId) return;
+    const key = storageEditing.key;
+
+    const ok = await confirmAction({
+        title: `Delete ${key}?`,
+        messageHtml: `This removes it from the live browser${storageArea === 'cookies' ? ` (${escapeHtml(storageEditing.domain || '')}${escapeHtml(storageEditing.path || '')})` : ''}, with no undo.`,
+        confirmLabel: 'Delete',
+    });
+    if (!ok) return;
+
+    const params = new URLSearchParams({ key });
+    if (storageArea === 'cookies') {
+        if (storageEditing.domain) params.set('domain', storageEditing.domain);
+        if (storageEditing.path) params.set('path', storageEditing.path);
+    }
+
+    try {
+        await fetchJsonOrThrow(
+            `/api/instances/${storageInstanceId}/tabs/${storageTabId}/storage/${storageArea}?${params.toString()}`,
+            { method: 'DELETE' });
+        closeStorageItemModal();
+        showControlNotice(`Deleted ${key}`, 'good');
+        loadStorage();
+    } catch (error) {
+        showControlNotice(error.message || 'Could not delete it', 'bad');
+    }
+}
+
+document.getElementById('btnStorageItemSave').addEventListener('click', () => saveStorageItem());
+document.getElementById('btnStorageItemDelete').addEventListener('click', () => deleteStorageItem());
+document.getElementById('btnStorageItemCancel').addEventListener('click', () => closeStorageItemModal({ warnUnsaved: true }));
+document.getElementById('btnStorageItemClose').addEventListener('click', () => closeStorageItemModal({ warnUnsaved: true }));
+document.getElementById('btnStorageItemCopy').addEventListener('click', async () => {
+    const ok = await writeClipboardText(storageItemValue.value);
+    showControlNotice(ok ? 'Copied the value' : 'Your browser blocked the clipboard', ok ? 'good' : 'bad');
+});
+
+// Re-indents the value in the box. It is not saved until Save is pressed, so
+// this reformats what the operator is about to write, never what is stored.
+document.getElementById('btnStorageItemPretty').addEventListener('click', () => {
+    try {
+        storageItemValue.value = JSON.stringify(JSON.parse(storageItemValue.value), null, 2);
+        storageItemHint.innerText = 'Re-indented. Press Save to write it back as it now reads.';
+    } catch (error) {
+        showControlNotice('That value is not JSON', 'bad');
+    }
+});
+
+storageItemModal.addEventListener('click', (e) => {
+    if (e.target.hasAttribute('data-storage-dismiss')) closeStorageItemModal({ warnUnsaved: true });
+});
+
+// Capture phase and stopped here, same as the request popup: the sheet lives
+// inside #controlModal, and a bubbling Escape would close the control view
+// behind it instead of the sheet in front.
+document.addEventListener('keydown', (e) => {
+    if (!storageModalOpen) return;
+    if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        closeStorageItemModal({ warnUnsaved: true });
+        return;
+    }
+    // Save from the keyboard, since the value box swallows a plain Enter.
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        e.stopPropagation();
+        saveStorageItem();
+    }
+}, true);
 
 // --- Stats & Server Logs ---
 function startStats() { fetchStats(); statsInterval = setInterval(fetchStats, 3000); }

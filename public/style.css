@@ -359,11 +359,13 @@ body {
     white-space: nowrap;
 }
 
-/* --- Network panel ------------------------------------------------------- */
-/* Sits under the live view like a browser's own drawer: the page keeps the
-   room it needs, the log takes a fixed slice rather than a share that moves
-   every time a request arrives. */
-.network-panel {
+/* --- The drawer under the live view -------------------------------------- */
+/* Network, console and storage all open in the same strip beneath the page,
+   like a browser's own drawer, and only one of them at a time: a 42% slice
+   split three ways would show none of them properly. The page above keeps the
+   room it needs - the drawer takes a fixed share rather than a share that
+   moves every time a row arrives. */
+.control-drawer {
     /* A fixed share of the control view, and it must not be squeezed: the
        screen above it is the flexible one. */
     flex: 0 0 42%;
@@ -373,7 +375,7 @@ body {
 }
 
 /* The control view is laid out as a column: address bar, the live frame, then
-   the network panel and the status bar. It carries Bootstrap's `flex-column`,
+   the drawer and the status bar. It carries Bootstrap's `flex-column`,
    but that utility only sets a direction - nothing ever made it a flex
    container, so the frame sized itself to the image and pushed the status bar
    out of the modal. `.d-none` keeps its !important, so hiding still wins. */
@@ -566,6 +568,168 @@ body {
     border-top: 1px solid var(--border-color);
     background: var(--bg-card);
 }
+
+/* --- Console ------------------------------------------------------------- */
+/* A transcript, so: monospace, one message per row, and a left edge that says
+   at a glance what kind of message it was. */
+.console-log {
+    font-family: var(--bs-font-monospace, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 0.75rem;
+    line-height: 1.5;
+}
+
+.console-row {
+    display: grid;
+    grid-template-columns: 18px 1fr auto;
+    gap: 0 6px;
+    align-items: start;
+    padding: 2px 8px 2px 4px;
+    border-bottom: 1px solid var(--border-color);
+    border-left: 3px solid transparent;
+    cursor: default;
+}
+
+.console-row:hover { background: var(--bg-hover); }
+.console-row:hover .console-copy { opacity: 1; }
+
+.console-gutter {
+    text-align: center;
+    font-size: 0.68rem;
+    opacity: 0.75;
+    user-select: none;
+}
+
+/* The message itself wraps and keeps its own newlines: a stack trace or a
+   serialised object is unreadable on one line, and a console that needs
+   sideways scrolling to read an error is not telling you the error. */
+.console-text {
+    white-space: pre-wrap;
+    word-break: break-word;
+    min-width: 0;
+}
+
+/* A fixed cap rather than a share of the row: the column that holds it is
+   sized by its own content, so a percentage would be a percentage of itself
+   and collapse the file name down to "127.…". */
+.console-origin {
+    color: var(--text-muted);
+    font-size: 0.66rem;
+    white-space: nowrap;
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.console-copy {
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 0.66rem;
+    padding: 0 2px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.12s ease-in-out;
+}
+
+.console-copy:hover { color: var(--text-main); }
+
+.console-row.lvl-error { border-left-color: #dc3545; background: rgba(220, 53, 69, 0.07); }
+.console-row.lvl-error .console-gutter { color: #dc3545; }
+.console-row.lvl-warn { border-left-color: #fd7e14; background: rgba(253, 126, 20, 0.07); }
+.console-row.lvl-warn .console-gutter { color: #fd7e14; }
+.console-row.lvl-info .console-gutter { color: #0dcaf0; }
+.console-row.lvl-debug { opacity: 0.75; }
+
+/* The two halves of a prompt exchange, marked the way a shell marks them: the
+   line you typed, then the line that came back. */
+.console-row.lvl-input { border-left-color: #6c757d; background: var(--bg-hover); }
+.console-row.lvl-input .console-text { color: var(--text-muted); }
+.console-row.lvl-result { border-left-color: #0d6efd; }
+.console-row.lvl-result .console-gutter { color: #0d6efd; }
+.console-row.kind-notice { color: var(--text-muted); font-style: italic; }
+
+/* A stack is the answer to "where", which is only wanted once the message
+   itself has been read - so it is there on a click, not before. */
+.console-stack {
+    grid-column: 2 / -1;
+    margin: 3px 0 2px;
+    padding-left: 10px;
+    border-left: 1px dashed var(--border-color);
+    color: var(--text-muted);
+    font-size: 0.68rem;
+    white-space: pre-wrap;
+}
+
+.console-row.has-stack { cursor: pointer; }
+
+.console-prompt { flex: 0 0 auto; }
+
+.console-prompt textarea {
+    resize: none;
+    background: transparent;
+    font-size: 0.76rem;
+    padding: 2px 4px;
+    max-height: 7.5em;
+    overflow-y: auto;
+}
+
+/* --- Storage ------------------------------------------------------------- */
+.storage-table {
+    font-size: 0.76rem;
+    table-layout: fixed;
+    width: 100%;
+}
+
+.storage-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--border-color);
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-muted);
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.storage-table td {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+    cursor: pointer;
+}
+
+.storage-table tbody tr:hover { background: var(--bg-hover); }
+.storage-table .storage-value { font-family: var(--bs-font-monospace, ui-monospace, Menlo, monospace); }
+/* Spelled the way the Set-Cookie header spells them: HttpOnly and SameSite
+   are names, and shouting them in capitals makes them harder to read, not
+   easier to notice. */
+.storage-table .storage-flag {
+    font-size: 0.64rem;
+    letter-spacing: 0.02em;
+    padding: 0 4px;
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    color: var(--text-muted);
+    margin-right: 3px;
+}
+
+/* The origin takes the slack in the header, so the buttons stay on the first
+   row. Letting them wrap costs a whole line of a drawer that is only a few
+   rows tall to begin with. */
+#storageOrigin {
+    flex: 1 1 60px;
+    min-width: 0;
+}
+
+/* The item editor borrows the request popup's sheet, but its body is one
+   column: a key, a value, and room to read the value. */
+.storage-item-dialog { width: min(760px, 100%); }
+.storage-item-body { display: block; }
+.storage-item-body textarea { resize: vertical; }
 
 /* --- Clipboard helper ---------------------------------------------------- */
 .control-paste-box {
