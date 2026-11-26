@@ -1285,6 +1285,34 @@ async function handleSetEmulation(req, res) {
   res.json({ success: true, emulation: state, reloaded: reload, presets: devicePresets.listPresets() });
 }
 
+
+// The live view scales a frame to its own width, so a tab whose window is a
+// different shape from the panel leaves the rest of the panel black. This
+// makes the page the panel's shape instead, so that space shows page.
+async function handleSetViewport(req, res) {
+  const instance = getInstanceByIdOrThrow(req.params.id);
+  const body = req.body || {};
+  const raw = body.aspect;
+  const clearing = raw === null || raw === undefined || raw === '' || raw === false;
+
+  if (clearing) {
+    await cdpClient.setViewportFit(instance.host, instance.port, req.params.tabId, null);
+    res.json({ success: true, viewport: null });
+    return;
+  }
+
+  const aspect = Number(raw);
+  if (!Number.isFinite(aspect) || aspect < 0.2 || aspect > 6) {
+    throw createHttpError(400, '"aspect" must be the panel\'s width divided by its height, between 0.2 and 6, or null to hand the viewport back');
+  }
+
+  const viewport = await cdpClient.setViewportFit(instance.host, instance.port, req.params.tabId, aspect);
+  // A tab under device emulation keeps the device's shape, and says so with a
+  // null viewport rather than by failing: the viewer asked for something that
+  // no longer applies, which is not an error.
+  res.json({ success: true, viewport });
+}
+
 async function handleNetworkStart(req, res) {
   const instance = getInstanceByIdOrThrow(req.params.id);
   const status = await networkRecorder.start(instance.host, instance.port, req.params.tabId);
@@ -1760,6 +1788,7 @@ function registerRoutes(router) {
   router.get('/instances/:id/tabs/:tabId/pdf', withErrorBoundary(handleTabPdf));
   router.get('/instances/:id/tabs/:tabId/emulation', withErrorBoundary(handleGetEmulation));
   router.post('/instances/:id/tabs/:tabId/emulation', withErrorBoundary(handleSetEmulation));
+  router.post('/instances/:id/tabs/:tabId/viewport', withErrorBoundary(handleSetViewport));
   router.get('/instances/:id/tabs/:tabId/selection', withErrorBoundary(handleGetTabSelection));
   router.post('/instances/:id/tabs/:tabId/paste', withErrorBoundary(handlePasteIntoTab));
   // Literal paths before the :requestId one, so "start"/"stop" cannot be read

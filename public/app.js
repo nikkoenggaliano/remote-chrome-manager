@@ -1066,6 +1066,9 @@ async function openControl(id, name) {
 function resetControlView() {
     lastCaptureScale = 1;
     lastViewport = null;
+    // Before the ids are forgotten: the tab keeps running after the panel
+    // closes, and it should go back to its own shape.
+    releaseViewportFit(currentInstanceId, currentTabId);
     stopStream();
     closeNetworkPanel({ stopRecorder: true });
     closeConsolePanel({ stopRecorder: true });
@@ -1085,9 +1088,11 @@ function resetControlView() {
 
 controlModalEl.addEventListener('hidden.bs.modal', () => {
     controlModalOpen = false;
-    currentInstanceId = null;
     stopTabPoll();
+    // Before the instance id is dropped: resetControlView hands the tab's
+    // viewport back, and it needs to know which instance to tell.
     resetControlView();
+    currentInstanceId = null;
 });
 
 // Re-rendering the list on every poll would flicker and drop hover state, so
@@ -1192,7 +1197,11 @@ function selectTab(id) {
     // switching tabs has to re-point them - otherwise a panel would show one
     // tab's traffic, console or storage while the view shows another's.
     lastViewport = null;
-    loadEmulation(id);
+    // The fit belongs to a tab too: a new tab is a different window with its
+    // own shape, and until it is fitted the panel would letterbox again.
+    fittedAspect = null;
+    setFittedChrome(false);
+    loadEmulation(id).then(() => syncViewportFit({ force: true }));
     if (networkOpen && networkTabId !== id) startNetworkForCurrentTab();
     if (consoleOpen && consoleTabId !== id) startConsoleForCurrentTab();
     if (storageOpen && storageTabId !== id) { closeStorageItemModal(); loadStorage(); }
@@ -1267,6 +1276,7 @@ const FRAME_TIMEOUT_MS = 6000;
 
 async function grabAndSwap() {
     if (!currentInstanceId || !currentTabId) return false;
+    maybeFitViewport();
     // Remember which tab this frame belongs to so a late-arriving frame from a
     // previously selected tab can never overwrite the current view.
     const reqInstance = currentInstanceId;
@@ -1365,6 +1375,147 @@ function startStream() {
 function stopStream() {
     streamToken++;          // any running loop sees a token mismatch and exits
     streamLoopActive = false;
+}
+
+
+// --- Fitting the page to the panel ----------------------------------------
+// The frame is drawn at the panel's full width, so a tab whose window is a
+// different shape from the panel runs out before the panel's bottom does and
+// the rest is black - about a third of it for a 1920x1080 window in a laptop
+// browser. Rather than letterbox that, the panel's shape is sent to the tab
+// and the page is made that shape, so the same space shows page.
+//
+// The aspect is rounded to a coarse step, so dragging the window does not send
+// a request per pixel of travel.
+let fittedAspect = null;
+let fitTimer = null;
+let fitBusy = false;
+// Turned off for good the first time a server answers that it has no such
+// route. Without it, a dashboard served by an older build would ask again on
+// every single frame and get a 404 every time.
+let fitSupported = true;
+
+function panelAspect() {
+    const rect = screenWrapper.getBoundingClientRect();
+    if (!(rect.width > 80) || !(rect.height > 80)) return null;
+    return Math.round((rect.width / rect.height) * 50) / 50;
+}
+
+// While the page is exactly the panel's shape there is nothing to scroll to,
+// and leaving the scrollbar enabled is actively harmful: it would appear on a
+// one-pixel rounding error, take width away from the panel, change the aspect,
+// and have the view resize itself in a loop.
+function setFittedChrome(on) {
+    screenWrapper.classList.toggle('overflow-hidden', on);
+    screenWrapper.classList.toggle('overflow-auto', !on);
+}
+
+async function syncViewportFit(options = {}) {
+    const { force = false } = options;
+    if (!fitSupported) return;
+    if (!currentInstanceId || !currentTabId || !controlModalOpen) return;
+    // A phone preview is shown at the phone's own size deliberately; stretching
+    // it to the panel is exactly what the preview exists to avoid.
+    if (currentEmulation) { setFittedChrome(false); return; }
+
+    const aspect = panelAspect();
+    // The panel has no size yet - the modal is still opening. Come back for it
+    // rather than giving up, or the view opens letterboxed and stays that way
+    // until something else happens to resize it.
+    if (!aspect) { scheduleViewportFit(300); return; }
+    if (!force && aspect === fittedAspect) return;
+    if (fitBusy) { scheduleViewportFit(200); return; }
+
+    fitBusy = true;
+    fittedAspect = aspect;
+
+    const instanceId = currentInstanceId;
+    const tabId = currentTabId;
+    try {
+        const res = await fetch(`/api/instances/${instanceId}/tabs/${tabId}/viewport`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ aspect }),
+        });
+        if (res.status === 401) { window.location.reload(); return; }
+        if (!res.ok) {
+            // This app answers in JSON even when it refuses. Anything else at
+            // this path is the router saying there is no such route, which is
+            // a server too old for this and never worth asking again.
+            if (!(res.headers.get('content-type') || '').includes('application/json')) {
+                fitSupported = false;
+                setFittedChrome(false);
+                return;
+            }
+            throw new Error(`viewport ${res.status}`);
+        }
+        const body = await res.json();
+        if (tabId !== currentTabId || instanceId !== currentInstanceId) return;
+        if (body && body.viewport && body.viewport.width > 0) {
+            // The page is a different size as of now, so the reading the last
+            // frame arrived with describes a viewport that no longer exists.
+            lastViewport = { width: body.viewport.width, height: body.viewport.height };
+            // A shape the page could not be given - a panel reduced to a
+            // sliver - still overflows, so the scrollbar stays.
+            setFittedChrome(!body.viewport.clamped);
+        } else {
+            // The server declined to fit it - device emulation owns the
+            // viewport - so the panel keeps its scrollbar.
+            setFittedChrome(false);
+        }
+        nudge(120);
+    } catch (error) {
+        // A tab that went away, or a request that did not arrive. The view
+        // still works, it just letterboxes, so put the scrollbar back. The
+        // aspect is deliberately left recorded: asking again for the same
+        // shape on the next frame would only repeat the failure, and a resize
+        // or a new tab tries again anyway.
+        setFittedChrome(false);
+    } finally {
+        fitBusy = false;
+    }
+}
+
+function scheduleViewportFit(delay = 250) {
+    clearTimeout(fitTimer);
+    fitTimer = setTimeout(() => syncViewportFit(), delay);
+}
+
+// Hand the viewport back, so a tab left running is not stuck in the shape of a
+// panel nobody is looking through any more.
+function releaseViewportFit(instanceId, tabId) {
+    clearTimeout(fitTimer);
+    fittedAspect = null;
+    setFittedChrome(false);
+    if (!instanceId || !tabId) return;
+    fetch(`/api/instances/${instanceId}/tabs/${tabId}/viewport`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ aspect: null }),
+        keepalive: true,
+    }).catch(() => {});
+}
+
+// Three ways of noticing, because no single one of them is reliable. The
+// observer is the quickest, but its callback runs with the rendering steps, so
+// a dashboard in a background or occluded window never gets one - and that is
+// exactly when a drawer opening would otherwise leave the view letterboxed
+// until the operator came back and jiggled something. The frame loop costs one
+// rect read per frame and catches everything, and the window event covers a
+// resize while the stream is paused.
+const panelResizeObserver = window.ResizeObserver && screenWrapper
+    ? new ResizeObserver(() => scheduleViewportFit())
+    : null;
+if (panelResizeObserver) panelResizeObserver.observe(screenWrapper);
+window.addEventListener('resize', () => scheduleViewportFit());
+
+// Called once per frame: a rect read and a number comparison, and only then a
+// request, so a panel that has not changed shape costs nothing.
+function maybeFitViewport() {
+    if (!fitSupported || !controlModalOpen || currentEmulation || fitBusy) return;
+    const aspect = panelAspect();
+    if (!aspect || aspect === fittedAspect) return;
+    syncViewportFit();
 }
 
 // Single refresh used by the manual refresh button.
@@ -1979,6 +2130,9 @@ async function applyDevice(device, presetId) {
         // The frame is about to change shape, and the old viewport reading
         // would map clicks wrongly until the next one arrives.
         lastViewport = null;
+        fittedAspect = null;
+        if (currentEmulation) setFittedChrome(false);
+        else syncViewportFit({ force: true });
         showControlNotice(currentEmulation
             ? `Showing ${currentEmulation.label} - ${currentEmulation.width}x${currentEmulation.height}, reloaded`
             : 'Back to the real desktop browser', 'good');
@@ -2208,6 +2362,7 @@ function openNetworkPanel() {
 }
 
 function closeNetworkPanel(options = {}) {
+    noteDrawerChanged();
     const { stopRecorder = true } = options;
     const previousInstance = networkInstanceId;
     const previousTab = networkTabId;
@@ -2719,7 +2874,14 @@ document.getElementById('btnNetworkClear').addEventListener('click', async () =>
 // Network, console and storage share one strip under the live view, and only
 // one of them holds it at a time: three panels in a 42% slice would each be too
 // short to read, and the live page would be left with nothing.
+// A drawer takes its height out of the live view, so whichever way one moves
+// the page has to be re-fitted to what is left.
+function noteDrawerChanged() {
+    scheduleViewportFit(200);
+}
+
 function closeOtherDrawers(keep) {
+    noteDrawerChanged();
     if (keep !== 'network' && networkOpen) closeNetworkPanel();
     if (keep !== 'console' && consoleOpen) closeConsolePanel();
     if (keep !== 'storage' && storageOpen) closeStoragePanel();
@@ -2789,6 +2951,7 @@ function openConsolePanel() {
 }
 
 function closeConsolePanel(options = {}) {
+    noteDrawerChanged();
     const { stopRecorder = true } = options;
     const previousInstance = consoleInstanceId;
     const previousTab = consoleTabId;
@@ -3201,6 +3364,7 @@ function openStoragePanel() {
 }
 
 function closeStoragePanel() {
+    noteDrawerChanged();
     storageOpen = false;
     closeStorageItemModal();
     storagePanel.classList.add('d-none');

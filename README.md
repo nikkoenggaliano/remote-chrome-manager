@@ -18,6 +18,12 @@ Chrome Fleet Control is a dashboard for managing multiple Chrome or Chromium ins
 - Smooth, low-latency **live tab control**: continuous flicker-free streaming from 10 fps
   up to Max, full mouse (click, drag, scroll, right-click) and **keyboard** input (typing,
   special keys, and Ctrl/Cmd shortcuts)
+- **The live view fills the panel.** A managed browser's window is 1920x1080 whatever
+  shape your panel is, so a frame scaled to its width used to stop a third of the way
+  short of the bottom and leave a black band. The page is now given the panel's shape
+  instead — only its height, so the site still lays out at its real width — and it is
+  re-fitted when a drawer opens or the window is resized. The tab gets its own shape
+  back when you close the control view
 - Tab toolbar with **back / forward / reload**, and an address bar that follows the page
   wherever it navigates itself
 - **Web / Mobile preview** per tab: viewport, user agent, Client Hints and touch are set
@@ -289,6 +295,7 @@ What it covers:
 | Tabs | list, open, close, `navigate`, `reload`, `history/back`, `history/forward`, `activate` |
 | Page content | `html` (loaded DOM, `format=json\|html\|text`), `evaluate`, `screenshot`, `pdf`, `inspect` |
 | Device | `emulation` — read or set viewport, user agent, Client Hints and touch per tab |
+| Viewport | `viewport` — give the tab the shape of whatever is watching it, so a viewer has no empty band under the page |
 | Network | `network/start`, `network` (poll with `since_seq`), `network/:requestId` (headers + body), `network/stop` |
 | Console | `console/start`, `console` (poll with `since_seq`), `console/eval` (run an expression and keep it in the transcript), `console/stop` |
 | Storage | `storage` (localStorage, sessionStorage and cookies in one read), `POST storage` (write one item or cookie), `DELETE storage/:area` (`?key=` one, or `?clear=1` the area) |
@@ -321,3 +328,7 @@ Two things worth knowing before you script against it:
   DevTools command line API available, and both the expression and its answer are appended
   to that tab's transcript. Use `POST /tabs/:tabId/evaluate` instead when you want one value
   and no transcript.
+- **`POST /instances/:id/tabs/:tabId/viewport` fits the page to whatever is showing it.**
+  Send `aspect` (the viewer's width over its height) and the tab is given that shape, so a
+  viewer has no empty band under the page. Only the height moves, so the site still lays
+  out at its real width. `aspect: null` hands the viewport back.

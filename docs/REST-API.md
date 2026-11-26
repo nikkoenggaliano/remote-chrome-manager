@@ -511,6 +511,50 @@ Overrides belong to the tab, not to the instance, and this server re-applies
 them whenever it rebuilds its CDP session for that tab, so they survive an idle
 disconnect. They do not survive the tab closing or the instance stopping.
 
+### Fitting the page to the viewer
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/instances/:id/tabs/:tabId/viewport` | Give the tab the shape of the thing watching it |
+
+```bash
+# a viewer 1100 px wide and 700 px tall
+curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"aspect":1.57}' $BASE/instances/$ID/tabs/$TAB/viewport
+# {"success":true,"viewport":{"width":1920,"height":1223,"clamped":false}}
+
+# hand the viewport back
+curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"aspect":null}' $BASE/instances/$ID/tabs/$TAB/viewport
+```
+
+A managed tab's window is 1920x1080 whatever shape the thing showing it is. A
+frame scaled to a viewer's width then runs out before the viewer's bottom does,
+and the rest is empty — about a third of the panel for a 1920x1080 window in a
+laptop browser. Send the viewer's `aspect`, its width divided by its height,
+and the page is made that shape, so the space shows page instead of nothing.
+
+Only the height moves. Overriding the width as well would re-flow the site at
+whatever width the viewer happens to be — a 900 px viewer would start getting
+the tablet build — and you asked to see the page, not a different rendering of
+it. The real width is measured once and reused, so repeated fits cannot walk it
+a few pixels narrower each time.
+
+The height is clamped to 120–4000 CSS pixels. A request that had to be clamped
+still answers 200 and says `clamped: true`, which is the viewer's cue to keep
+its scrollbar: the frame is still taller than it is.
+
+A tab under device emulation keeps the device's shape — the whole point of a
+phone preview — and the answer is `viewport: null` rather than an error.
+
+The fit is re-applied whenever this server rebuilds the tab's CDP session, so
+it survives an idle disconnect, and it is dropped when the tab closes, the
+instance stops, or `POST /emulation` takes the viewport over.
+
+The dashboard does this for you: the live view sends its own shape when you
+open a tab, when a drawer opens or closes under it, and when the window is
+resized, and hands the viewport back when you close the control view.
+
 ### Network log
 
 | Method | Path | Purpose |
